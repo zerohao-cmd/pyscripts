@@ -68,6 +68,8 @@ class GrpcEndpointSpec(BaseModel):
     service: str
     method: str
     descriptor_path: str = "descriptor.pb"
+    generated: bool = False
+    response_wrapped: bool = False
 
     model_config = {"extra": "forbid"}
 
@@ -103,6 +105,9 @@ class EndpointSpec(BaseModel):
     id: str
     task_type: Literal["io", "compute"]
     entrypoint: str
+    io_type: list[Literal["rest", "grpc"]] = Field(
+        default_factory=lambda: ["rest"], min_length=1
+    )
     parameters: dict[str, dict[str, Any]] = Field(default_factory=dict)
     response_schema: dict[str, Any] = Field(default_factory=dict)
     grpc: GrpcEndpointSpec | None = None
@@ -119,8 +124,19 @@ class EndpointSpec(BaseModel):
             raise ValueError("entrypoint must use 'package.module:function'")
         return value
 
+    @field_validator("io_type")
+    @classmethod
+    def unique_io_types(
+        cls, values: list[Literal["rest", "grpc"]]
+    ) -> list[Literal["rest", "grpc"]]:
+        if len(values) != len(set(values)):
+            raise ValueError("io_type values must be unique")
+        return values
+
     @model_validator(mode="after")
     def compute_resources_only(self) -> EndpointSpec:
+        if self.grpc is not None and "io_type" not in self.model_fields_set:
+            self.io_type = ["grpc"]
         if self.task_type != "compute" and (
             self.num_cpus is not None or self.num_gpus is not None
         ):
@@ -245,14 +261,37 @@ class RevisionInterfaceSpec(BaseModel):
 
     @model_validator(mode="after")
     def require_contract_for_grpc(self) -> RevisionInterfaceSpec:
-        grpc_endpoints = [endpoint for endpoint in self.endpoints if endpoint.grpc]
-        if grpc_endpoints and self.grpc_contract is None:
+        legacy_grpc = [endpoint for endpoint in self.endpoints if endpoint.grpc]
+        generated_grpc = [
+            endpoint
+            for endpoint in self.endpoints
+            if "grpc" in endpoint.io_type and endpoint.grpc is None
+        ]
+        if legacy_grpc and generated_grpc:
+            raise ValueError(
+                "legacy grpc metadata cannot be mixed with generated grpc endpoints"
+            )
+        if legacy_grpc and self.grpc_contract is None:
             raise ValueError(
                 "grpc_contract is required when gRPC endpoints are declared"
             )
+        if generated_grpc and self.grpc_contract is not None:
+            raise ValueError(
+                "grpc_contract is generated automatically when io_type contains grpc"
+            )
+        missing_responses = [
+            endpoint.id
+            for endpoint in generated_grpc
+            if not endpoint.response_schema
+        ]
+        if missing_responses:
+            raise ValueError(
+                "generated gRPC endpoints require response_schema: "
+                + ", ".join(missing_responses)
+            )
         descriptor_paths = {
             endpoint.grpc.descriptor_path
-            for endpoint in grpc_endpoints
+            for endpoint in legacy_grpc
             if endpoint.grpc is not None
         }
         if len(descriptor_paths) > 1:
@@ -436,6 +475,17 @@ class InvocationListItemResponse(BaseModel):
     execution_kind: str | None = None
     runtime_profile: str | None = None
     environment_digest: str | None = None
+    has_logs: bool = False
+    log_bytes: int = 0
+    logs_truncated: bool = False
+
+
+class InvocationLogResponse(BaseModel):
+    sequence: int
+    stream: Literal["STDOUT", "STDERR"]
+    content: str
+    emitted_at: datetime
+    created_at: datetime
 
 
 class InvocationResponse(BaseModel):

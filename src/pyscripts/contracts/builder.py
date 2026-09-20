@@ -20,7 +20,12 @@ import grpc_tools
 from google.protobuf import descriptor_pb2
 from google.protobuf.message import DecodeError
 
-from pyscripts.schemas import ResolvedRevisionRequest
+from pyscripts.schemas import EndpointSpec, GrpcContractSpec, ResolvedRevisionRequest
+from pyscripts.contracts.generator import (
+    GENERATED_DESCRIPTOR_PATH,
+    ProtoGenerationError,
+    generate_contract,
+)
 
 
 class ContractBuildError(RuntimeError):
@@ -43,6 +48,14 @@ class PublishedContract:
     package_version: str
     wheel_uri: str
     wheel_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedGeneratedArtifact:
+    artifact_uri: str
+    artifact_digest: str
+    endpoints: list[EndpointSpec]
+    contract: GrpcContractSpec
 
 
 class PythonSdkPublisher:
@@ -167,6 +180,82 @@ class PythonSdkPublisher:
                 wheel_digest=_sha256(wheel_target.read_bytes()),
             )
 
+    def prepare_generated_artifact(
+        self,
+        service_name: str,
+        request: ResolvedRevisionRequest,
+        *,
+        previous_descriptor: bytes | None = None,
+        previous_version: str | None = None,
+    ) -> PreparedGeneratedArtifact | None:
+        try:
+            generated = generate_contract(
+                service_name,
+                request.endpoints,
+                previous_descriptor=previous_descriptor,
+                previous_version=previous_version,
+            )
+        except ProtoGenerationError as error:
+            raise ContractBuildError(str(error)) from error
+        if generated is None:
+            return None
+
+        with tempfile.TemporaryDirectory(prefix="pyscripts-generated-proto-") as name:
+            temporary = Path(name)
+            archive = self._obtain_artifact(
+                request.artifact_uri,
+                request.artifact_digest,
+                temporary,
+            )
+            source_root = temporary / "source"
+            self._extract_archive(archive, source_root)
+            generated_root = source_root / ".pyscripts" / "generated"
+            if generated_root.exists():
+                raise ContractBuildError(
+                    "artifact path .pyscripts/generated is reserved by the platform"
+                )
+            proto_path = source_root / generated.proto_path
+            proto_path.parent.mkdir(parents=True)
+            proto_path.write_text(generated.proto_source, encoding="utf-8")
+
+            compiled_root = temporary / "compiled"
+            compiled_root.mkdir()
+            descriptor_path = source_root / GENERATED_DESCRIPTOR_PATH
+            self._run_protoc(
+                source_root / generated.contract.proto_root,
+                [proto_path],
+                compiled_root,
+                descriptor_path,
+            )
+            canonical_descriptor = _canonical_descriptor(descriptor_path.read_bytes())
+            descriptor_path.write_bytes(canonical_descriptor)
+
+            contract = generated.contract
+            if previous_descriptor is not None:
+                previous_canonical = _canonical_descriptor(previous_descriptor)
+                if previous_canonical == canonical_descriptor and previous_version:
+                    contract = contract.model_copy(update={"version": previous_version})
+
+            augmented = temporary / "artifact.zip"
+            self._build_augmented_artifact(source_root, augmented)
+            digest = _sha256(augmented.read_bytes())
+            target_root = self.artifact_root / "generated-artifacts"
+            target_root.mkdir(parents=True, exist_ok=True)
+            target = target_root / f"{digest}.zip"
+            if not target.exists():
+                temporary_target = target.with_suffix(
+                    f".zip.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                )
+                shutil.copyfile(augmented, temporary_target)
+                os.replace(temporary_target, target)
+
+            return PreparedGeneratedArtifact(
+                artifact_uri=target.resolve().as_uri(),
+                artifact_digest=digest.removeprefix("sha256:"),
+                endpoints=generated.endpoints,
+                contract=contract,
+            )
+
     def resolve_local_uri(self, uri: str) -> Path:
         parsed = urllib.parse.urlparse(uri)
         if parsed.scheme != "file":
@@ -175,6 +264,22 @@ class PythonSdkPublisher:
         if not path.is_relative_to(self.artifact_root) or not path.is_file():
             raise ContractBuildError("contract artifact is outside the configured root")
         return path
+
+    @staticmethod
+    def _build_augmented_artifact(source_root: Path, target: Path) -> None:
+        files = sorted(path for path in source_root.rglob("*") if path.is_file())
+        with zipfile.ZipFile(
+            target, "w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            for path in files:
+                relative = path.relative_to(source_root).as_posix()
+                info = zipfile.ZipInfo(
+                    relative,
+                    date_time=(1980, 1, 1, 0, 0, 0),
+                )
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o100644 << 16
+                archive.writestr(info, path.read_bytes())
 
     def _run_protoc(
         self,

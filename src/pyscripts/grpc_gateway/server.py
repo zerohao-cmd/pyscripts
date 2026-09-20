@@ -14,6 +14,7 @@ from pyscripts.grpc_gateway.registry import GrpcRoute, GrpcRouteRegistry
 from pyscripts.models import InvocationStatus
 from pyscripts.repository import PlatformRepository
 from pyscripts.runtime.directory import PoolOverloadedError, ProfilePoolScheduler
+from pyscripts.runtime.output import ExecutionOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ class GrpcInvocationDispatcher:
             request_id = invocation.id
 
         try:
-            result = await asyncio.wait_for(
+            raw_result = await asyncio.wait_for(
                 self._profile_scheduler.execute_grpc(target, request_id, payload),
                 timeout=self._timeout_seconds,
             )
@@ -99,26 +100,61 @@ class GrpcInvocationDispatcher:
             )
             await context.abort(grpc.StatusCode.INTERNAL, "script execution failed")
 
-        await self._finish(request_id, InvocationStatus.SUCCEEDED)
+        outcome = (
+            raw_result
+            if isinstance(raw_result, ExecutionOutcome)
+            else ExecutionOutcome(succeeded=True, value=raw_result)
+        )
+        if not outcome.succeeded:
+            await self._finish(
+                request_id,
+                InvocationStatus.FAILED,
+                outcome=outcome,
+            )
+            await context.abort(grpc.StatusCode.INTERNAL, "script execution failed")
+
+        if not isinstance(outcome.value, bytes):
+            error = TypeError("gRPC script returned a non-bytes result")
+            await self._finish(request_id, InvocationStatus.FAILED, error)
+            await context.abort(grpc.StatusCode.INTERNAL, "script execution failed")
+
+        await self._finish(
+            request_id,
+            InvocationStatus.SUCCEEDED,
+            outcome=outcome,
+        )
         context.set_trailing_metadata(
             (
                 ("pyscripts-request-id", str(request_id)),
                 ("pyscripts-revision", target.revision),
             )
         )
-        return result
+        return outcome.value
 
     async def _finish(
         self,
         request_id: uuid.UUID,
         status: InvocationStatus,
         error: BaseException | None = None,
+        outcome: ExecutionOutcome | None = None,
     ) -> None:
+        error_text = str(error)[:4000] if error is not None else None
+        if outcome is not None and not outcome.succeeded:
+            error_text = ": ".join(
+                part
+                for part in (outcome.error_type, outcome.error_message)
+                if part
+            )[:4000]
         async with session_scope(self._session_factory) as session:
             await PlatformRepository(session).finish_invocation(
                 request_id,
                 status,
-                str(error)[:4000] if error is not None else None,
+                error_text,
+                logs=outcome.logs if outcome is not None else (),
+                log_bytes=outcome.log_bytes if outcome is not None else 0,
+                logs_truncated=(
+                    outcome.logs_truncated if outcome is not None else False
+                ),
             )
 
 

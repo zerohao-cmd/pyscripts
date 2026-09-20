@@ -13,7 +13,7 @@ from pyscripts.runtime.loader import EndpointDefinition, VersionedRuntime
 Transport = Literal["http", "grpc"]
 
 _event_loop: asyncio.AbstractEventLoop | None = None
-_runtimes: dict[tuple[str, str], VersionedRuntime] = {}
+_runtimes: dict[tuple[str, str, int, int, bool], VersionedRuntime] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,8 +22,20 @@ class ComputeTaskResult:
     node_id: str
 
 
-def _worker_runtime(cache_root: str, environment_digest: str) -> VersionedRuntime:
-    key = (cache_root, environment_digest)
+def _worker_runtime(
+    cache_root: str,
+    environment_digest: str,
+    invocation_log_max_bytes: int,
+    invocation_log_chunk_bytes: int,
+    capture_stderr: bool,
+) -> VersionedRuntime:
+    key = (
+        cache_root,
+        environment_digest,
+        invocation_log_max_bytes,
+        invocation_log_chunk_bytes,
+        capture_stderr,
+    )
     runtime = _runtimes.get(key)
     if runtime is None:
         root = Path(cache_root)
@@ -32,6 +44,9 @@ def _worker_runtime(cache_root: str, environment_digest: str) -> VersionedRuntim
             max_io=1,
             artifact_cache_root=root / "artifacts",
             retain_extracted_on_unload=True,
+            invocation_log_max_bytes=invocation_log_max_bytes,
+            invocation_log_chunk_bytes=invocation_log_chunk_bytes,
+            capture_stderr=capture_stderr,
         )
         _runtimes[key] = runtime
     return runtime
@@ -58,9 +73,19 @@ def run_compute_task(
     artifact_digest: str,
     endpoint_manifest: list[dict[str, Any]],
     include_metadata: bool = False,
+    capture: bool = False,
+    invocation_log_max_bytes: int = 64 * 1024,
+    invocation_log_chunk_bytes: int = 4 * 1024,
+    capture_stderr: bool = True,
 ) -> Any:
     """Execute one immutable compute snapshot inside a reusable Ray worker."""
-    runtime = _worker_runtime(cache_root, environment_digest)
+    runtime = _worker_runtime(
+        cache_root,
+        environment_digest,
+        invocation_log_max_bytes,
+        invocation_log_chunk_bytes,
+        capture_stderr,
+    )
     endpoints = [EndpointDefinition.from_manifest(item) for item in endpoint_manifest]
     loop = _loop()
     try:
@@ -76,6 +101,7 @@ def run_compute_task(
                 artifact_uri=artifact_uri,
                 artifact_digest=artifact_digest,
                 endpoints=endpoints,
+                capture=capture,
             )
         else:
             if not isinstance(payload, dict):
@@ -89,6 +115,7 @@ def run_compute_task(
                 artifact_uri=artifact_uri,
                 artifact_digest=artifact_digest,
                 endpoints=endpoints,
+                capture=capture,
             )
         value = loop.run_until_complete(operation)
         if include_metadata:

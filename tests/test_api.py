@@ -10,6 +10,7 @@ from pydantic import SecretStr
 
 from pyscripts.api import create_app
 from pyscripts.config import Settings
+from pyscripts.runtime.output import CapturedLogChunk, ExecutionOutcome
 
 
 class FakeArtifactStore:
@@ -149,6 +150,32 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
         assert manual.status_code == 200
         assert manual.json()["check_interval_seconds"] is None
 
+        stopped = client.post(f"/admin/services/{service['id']}/stop")
+        assert stopped.status_code == 200
+        assert stopped.json()["status"] == "STOPPED"
+        assert stopped.json()["active_revision_id"] == revision["id"]
+
+        unavailable = client.post(
+            "/v1/services/math-service/run",
+            json={"value": 42},
+        )
+        assert unavailable.status_code == 404
+
+        selected_while_stopped = client.post(
+            f"/admin/services/{service['id']}/revisions/{revision['id']}/activate"
+        )
+        assert selected_while_stopped.status_code == 200
+        still_stopped = client.get(f"/admin/services/{service['id']}")
+        assert still_stopped.json()["status"] == "STOPPED"
+
+        started = client.post(f"/admin/services/{service['id']}/start")
+        assert started.status_code == 200
+        assert started.json()["status"] == "ACTIVE"
+        assert started.json()["active_revision_id"] == revision["id"]
+
+        duplicate_start = client.post(f"/admin/services/{service['id']}/start")
+        assert duplicate_start.status_code == 409
+
         invocations = client.get("/admin/invocations")
         assert invocations.status_code == 200
         assert invocations.json() == []
@@ -158,6 +185,33 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
         )
         assert service_invocations.status_code == 200
         assert service_invocations.json() == []
+
+        class FakeScheduler:
+            async def execute(self, target, request_id, params):
+                return ExecutionOutcome(
+                    succeeded=True,
+                    value=params["value"],
+                    logs=(
+                        CapturedLogChunk(0, "STDOUT", "hello from script\n"),
+                    ),
+                    log_bytes=18,
+                )
+
+        app.state.profile_scheduler = FakeScheduler()
+        invoked = client.post(
+            "/v1/services/math-service/run",
+            json={"value": 42},
+        )
+        assert invoked.status_code == 200, invoked.text
+        request_id = invoked.json()["request_id"]
+        records = client.get("/admin/invocations").json()
+        assert records[0]["has_logs"] is True
+        assert records[0]["log_bytes"] == 18
+        logs = client.get(f"/admin/invocations/{request_id}/logs")
+        assert logs.status_code == 200
+        assert logs.json()[0]["stream"] == "STDOUT"
+        assert logs.json()[0]["content"] == "hello from script\n"
+        assert logs.json()[0]["emitted_at"].endswith("Z")
 
 
 def test_ui_is_served_when_distribution_exists(tmp_path: Path) -> None:

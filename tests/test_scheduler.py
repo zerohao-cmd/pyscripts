@@ -31,6 +31,12 @@ def test_io_packs_into_the_busiest_shared_actor() -> None:
     assert [item.replica for item in ordered] == [2, 1, 0]
 
 
+def test_actor_name_uses_current_wire_protocol() -> None:
+    assert ProfilePoolScheduler._actor_name("test@v2", 3).startswith(
+        "pyscripts-runtime-v5-"
+    )
+
+
 async def test_compute_is_submitted_as_ray_task_not_actor(monkeypatch) -> None:
     class FakeComputeTask:
         options_value: dict | None = None
@@ -89,7 +95,8 @@ async def test_compute_is_submitted_as_ray_task_not_actor(monkeypatch) -> None:
 
     result = await scheduler.execute(target, uuid.uuid4(), {"x": 20, "y": 22})
 
-    assert result == {"value": 42}
+    assert result.succeeded is True
+    assert result.value == {"value": 42}
     assert FakeComputeTask.options_value is not None
     assert FakeComputeTask.options_value["num_cpus"] == 2
     assert "py_modules" not in FakeComputeTask.options_value["runtime_env"]
@@ -148,8 +155,8 @@ async def test_compute_reuses_warm_profile_node_with_pool_fallback(monkeypatch) 
         worker_pool="py312-ray258-default",
     )
 
-    assert await scheduler.execute(target, uuid.uuid4(), {}) == {"value": 42}
-    assert await scheduler.execute(target, uuid.uuid4(), {}) == {"value": 42}
+    assert (await scheduler.execute(target, uuid.uuid4(), {})).value == {"value": 42}
+    assert (await scheduler.execute(target, uuid.uuid4(), {})).value == {"value": 42}
 
     assert FakeComputeTask.options_values[0]["label_selector"] == {
         "pyscripts.worker-pool": "py312-ray258-default"

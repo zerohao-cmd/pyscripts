@@ -4,6 +4,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -41,6 +42,7 @@ from pyscripts.repository import (
     RuntimeProfileRecord,
 )
 from pyscripts.runtime.directory import PoolOverloadedError, ProfilePoolScheduler
+from pyscripts.runtime.output import ExecutionOutcome
 from pyscripts.runtime.profiles import (
     RayRuntimeEnvironmentValidator,
     RuntimeEnvironmentValidator,
@@ -55,6 +57,7 @@ from pyscripts.schemas import (
     CreateRuntimeProfileVersionRequest,
     CreateServiceRequest,
     InvocationListItemResponse,
+    InvocationLogResponse,
     InvocationResponse,
     RevisionDetailResponse,
     RevisionInterfaceSpec,
@@ -548,6 +551,11 @@ def create_app(
             environment_digest=(
                 record.execution.environment_digest if record.execution else None
             ),
+            has_logs=bool(record.execution and record.execution.log_bytes),
+            log_bytes=(record.execution.log_bytes if record.execution else 0),
+            logs_truncated=(
+                record.execution.logs_truncated if record.execution else False
+            ),
         )
 
     @app.get(
@@ -580,6 +588,39 @@ def create_app(
         except NotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         return [invocation_response(record) for record in records]
+
+    @app.get(
+        "/admin/invocations/{invocation_id}/logs",
+        response_model=list[InvocationLogResponse],
+    )
+    async def list_invocation_logs(
+        invocation_id: uuid.UUID,
+        session: SessionDependency,
+        after_sequence: int = -1,
+        limit: int = 500,
+    ) -> list[InvocationLogResponse]:
+        try:
+            logs = await PlatformRepository(session).list_invocation_logs(
+                invocation_id,
+                after_sequence=after_sequence,
+                limit=max(1, min(limit, 2000)),
+            )
+        except NotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return [
+            InvocationLogResponse(
+                sequence=log.sequence,
+                stream=log.stream,
+                content=log.content,
+                emitted_at=(
+                    log.emitted_at
+                    if log.emitted_at.tzinfo is not None
+                    else log.emitted_at.replace(tzinfo=UTC)
+                ),
+                created_at=log.created_at,
+            )
+            for log in logs
+        ]
 
     async def resolve_revision_profile(
         repository: PlatformRepository,
@@ -615,6 +656,35 @@ def create_app(
         runtime_profile: RuntimeProfileRecord | None,
         session: AsyncSession,
     ) -> Revision:
+        async with session.begin():
+            previous_contract = await PlatformRepository(session).get_latest_contract(
+                service_id
+            )
+        previous_descriptor = None
+        previous_version = None
+        if previous_contract is not None:
+            previous_path = app.state.sdk_publisher.resolve_local_uri(
+                previous_contract.descriptor_uri
+            )
+            previous_descriptor = await asyncio.to_thread(previous_path.read_bytes)
+            previous_version = previous_contract.contract_version
+
+        prepared = await asyncio.to_thread(
+            app.state.sdk_publisher.prepare_generated_artifact,
+            service_name,
+            source_body,
+            previous_descriptor=previous_descriptor,
+            previous_version=previous_version,
+        )
+        if prepared is not None:
+            source_body = source_body.model_copy(
+                update={
+                    "artifact_uri": prepared.artifact_uri,
+                    "artifact_digest": prepared.artifact_digest,
+                    "endpoints": prepared.endpoints,
+                    "grpc_contract": prepared.contract,
+                }
+            )
         published = await asyncio.to_thread(
             app.state.sdk_publisher.publish,
             service_name,
@@ -811,6 +881,23 @@ def create_app(
                 service = await PlatformRepository(session).stop_service(service_id)
         except NotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
+        except InvalidTransitionError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        await app.state.grpc_routes.refresh(app.state.session_factory)
+        return ServiceResponse.model_validate(service)
+
+    @app.post("/admin/services/{service_id}/start", response_model=ServiceResponse)
+    async def start_service(
+        service_id: uuid.UUID,
+        session: SessionDependency,
+    ) -> ServiceResponse:
+        try:
+            async with session.begin():
+                service = await PlatformRepository(session).start_service(service_id)
+        except NotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except InvalidTransitionError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         await app.state.grpc_routes.refresh(app.state.session_factory)
         return ServiceResponse.model_validate(service)
 
@@ -820,6 +907,7 @@ def create_app(
     ) -> ContractResponse:
         contract = bundle.contract
         sdk = bundle.sdk
+        sdk_path = app.state.sdk_publisher.resolve_local_uri(sdk.artifact_uri)
         return ContractResponse(
             id=contract.id,
             service=bundle.service.name,
@@ -841,7 +929,11 @@ def create_app(
                 package_version=sdk.package_version,
                 artifact_digest=sdk.artifact_digest,
                 download_url=str(
-                    request.url_for("download_python_sdk", contract_id=contract.id)
+                    request.url_for(
+                        "download_python_sdk_file",
+                        contract_id=contract.id,
+                        filename=sdk_path.name,
+                    )
                 ),
             ),
         )
@@ -899,11 +991,35 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         return FileResponse(path, media_type="application/zip", filename="proto.zip")
 
+    @app.api_route(
+        "/v1/contracts/{contract_id}/python-sdk/{filename}",
+        methods=["GET", "HEAD"],
+        name="download_python_sdk_file",
+    )
+    async def download_python_sdk_file(
+        contract_id: uuid.UUID,
+        filename: str,
+        session: SessionDependency,
+    ) -> FileResponse:
+        try:
+            bundle = await PlatformRepository(session).get_contract(contract_id)
+            path = app.state.sdk_publisher.resolve_local_uri(bundle.sdk.artifact_uri)
+        except (NotFoundError, ContractBuildError) as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        if filename != path.name:
+            raise HTTPException(status_code=404, detail="Python SDK file does not exist")
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename=path.name,
+        )
+
     @app.get(
         "/v1/contracts/{contract_id}/python-sdk",
-        name="download_python_sdk",
+        name="download_python_sdk_legacy",
+        include_in_schema=False,
     )
-    async def download_python_sdk(
+    async def download_python_sdk_legacy(
         contract_id: uuid.UUID,
         session: SessionDependency,
     ) -> FileResponse:
@@ -933,13 +1049,15 @@ def create_app(
             async with session_scope(factory) as session:
                 repository = PlatformRepository(session)
                 target = await repository.resolve_endpoint(service_name, endpoint_id)
+                if "rest" not in target.io_type:
+                    raise NotFoundError("active service REST endpoint does not exist")
                 invocation = await repository.begin_invocation(target)
                 request_id = invocation.id
         except NotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
         try:
-            result = await asyncio.wait_for(
+            raw_result = await asyncio.wait_for(
                 request.app.state.profile_scheduler.execute(
                     target, request_id, params
                 ),
@@ -970,15 +1088,41 @@ def create_app(
                 status_code=502, detail="script execution failed"
             ) from error
 
+        outcome = (
+            raw_result
+            if isinstance(raw_result, ExecutionOutcome)
+            else ExecutionOutcome(succeeded=True, value=raw_result)
+        )
+        if not outcome.succeeded:
+            error_text = ": ".join(
+                part
+                for part in (outcome.error_type, outcome.error_message)
+                if part
+            )[:4000]
+            async with session_scope(factory) as session:
+                await PlatformRepository(session).finish_invocation(
+                    request_id,
+                    InvocationStatus.FAILED,
+                    error_text or "script execution failed",
+                    logs=outcome.logs,
+                    log_bytes=outcome.log_bytes,
+                    logs_truncated=outcome.logs_truncated,
+                )
+            raise HTTPException(status_code=502, detail="script execution failed")
+
         async with session_scope(factory) as session:
             await PlatformRepository(session).finish_invocation(
-                request_id, InvocationStatus.SUCCEEDED
+                request_id,
+                InvocationStatus.SUCCEEDED,
+                logs=outcome.logs,
+                log_bytes=outcome.log_bytes,
+                logs_truncated=outcome.logs_truncated,
             )
         return InvocationResponse(
             request_id=request_id,
             service=target.service_name,
             revision=target.revision,
-            result=result,
+            result=outcome.value,
         )
 
     ui_dist = app_settings.ui_dist_path.resolve()

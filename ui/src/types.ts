@@ -37,12 +37,15 @@ export interface GrpcEndpoint {
   service: string;
   method: string;
   descriptor_path: string;
+  generated?: boolean;
+  response_wrapped?: boolean;
 }
 
 export interface Endpoint {
   id: string;
   task_type: "io" | "compute";
   entrypoint: string;
+  io_type?: ("rest" | "grpc")[];
   response_schema?: Record<string, unknown>;
   grpc?: GrpcEndpoint | null;
   num_cpus?: number | null;
@@ -84,6 +87,17 @@ export interface Invocation {
   execution_kind: "IO_ACTOR" | "COMPUTE_TASK" | null;
   runtime_profile: string | null;
   environment_digest: string | null;
+  has_logs: boolean;
+  log_bytes: number;
+  logs_truncated: boolean;
+}
+
+export interface InvocationLog {
+  sequence: number;
+  stream: "STDOUT" | "STDERR";
+  content: string;
+  emitted_at: string;
+  created_at: string;
 }
 
 export interface SdkArtifact {

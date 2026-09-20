@@ -206,8 +206,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .data-table td { min-width: 95px; padding: 14px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; white-space: nowrap; }
 .data-table tbody tr:last-child td { border-bottom: 0; }
 .data-table tbody tr:hover { background: rgb(255 255 255 / 1.5%); }
+.data-table tbody tr.is-clickable { cursor: pointer; }
+.data-table tbody tr.is-clickable:focus-within, .data-table tbody tr.is-clickable:hover { background: rgb(66 236 131 / 4%); }
 .data-table td:nth-child(2) { min-width: 150px; }
 .cell-sub { display: block; margin-top: 4px; color: var(--faint); font-size: 10px; }
+.log-available { color: var(--mint); }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .muted { color: var(--muted); }
 
@@ -306,6 +309,17 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .modal { width: min(680px, 100%); max-height: calc(100vh - 60px); overflow-y: auto; border: 1px solid var(--border-strong); border-radius: 16px; background: #141a17; box-shadow: 0 30px 90px rgb(0 0 0 / 55%); }
 .modal__header { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 22px 24px; border-bottom: 1px solid var(--border); }
 .modal__header h2 { font-size: 22px; letter-spacing: -.035em; }
+.invocation-log-detail { display: grid; gap: 16px; padding: 24px; }
+.invocation-log-meta { display: grid; grid-template-columns: .7fr 2fr .7fr .7fr; gap: 12px; }
+.invocation-log-meta > div { display: grid; min-width: 0; align-content: start; gap: 7px; }
+.invocation-log-meta span { color: var(--faint); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
+.invocation-log-meta code { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.log-console { min-height: 220px; max-height: 52vh; overflow: auto; margin: 0; padding: 15px 16px; border: 1px solid var(--border); border-radius: 10px; color: #d7e1db; background: #090d0b; font: 11px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+.log-console--empty { display: grid; place-items: center; color: var(--faint); }
+.log-line { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; min-height: 18px; }
+.log-line time { color: #68766e; user-select: none; }
+.log-line > span { white-space: pre-wrap; }
+.log-line--stderr { color: #ffaaa5; }
 .form-stack { display: grid; gap: 17px; padding: 24px; }
 .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .field { display: grid; min-width: 0; gap: 8px; }
@@ -385,6 +399,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .runtime-version { grid-template-columns: minmax(0, 1fr) auto; gap: 10px; padding: 13px; }
   .runtime-version__actions { grid-column: 1 / -1; justify-content: flex-start; }
   .field-grid { grid-template-columns: 1fr; }
+  .invocation-log-detail { padding: 18px; }
+  .invocation-log-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .modal-backdrop { padding: 0; place-items: end center; }
   .modal { max-height: 92vh; border-radius: 16px 16px 0 0; }
   .modal__header, .form-stack { padding-inline: 18px; }

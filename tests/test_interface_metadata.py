@@ -67,6 +67,55 @@ def test_parses_flat_function_parameters() -> None:
     assert "request_schema" not in manifest
 
 
+def test_generated_grpc_uses_the_same_flat_function_parameters() -> None:
+    interface = parse_interface_document(
+        document_with_interface(
+            {
+                "spec_version": 1,
+                "endpoints": [
+                    {
+                        "id": "add",
+                        "task_type": "compute",
+                        "entrypoint": "service:add",
+                        "io_type": ["rest", "grpc"],
+                        "x": {"type": "Int64"},
+                        "y": {"type": "Int64"},
+                        "response_schema": {"type": "Int64"},
+                    }
+                ],
+            }
+        )
+    )
+
+    endpoint = interface.endpoints[0]
+    assert endpoint.io_type == ["rest", "grpc"]
+    assert endpoint.grpc is None
+    assert list(endpoint.parameters) == ["x", "y"]
+    assert interface.grpc_contract is None
+
+
+def test_generated_grpc_requires_a_response_schema() -> None:
+    with pytest.raises(
+        InterfaceMetadataError, match="generated gRPC endpoints require response_schema"
+    ):
+        parse_interface_document(
+            document_with_interface(
+                {
+                    "spec_version": 1,
+                    "endpoints": [
+                        {
+                            "id": "add",
+                            "task_type": "compute",
+                            "entrypoint": "service:add",
+                            "io_type": ["grpc"],
+                            "x": {"type": "Int64"},
+                        }
+                    ],
+                }
+            )
+        )
+
+
 def test_rejects_split_type_and_format_schema() -> None:
     with pytest.raises(InterfaceMetadataError, match="unsupported field.*format"):
         parse_interface_document(

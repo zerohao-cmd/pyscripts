@@ -23,6 +23,8 @@ class GrpcEndpointDefinition:
     service: str
     method: str
     descriptor_path: str = "descriptor.pb"
+    generated: bool = False
+    response_wrapped: bool = False
 
     @property
     def method_path(self) -> str:
@@ -78,6 +80,88 @@ class GrpcCodec:
             "gRPC handler must return a protobuf Message, serialized bytes, "
             "or a mapping compatible with the response message"
         )
+
+
+def generated_request_arguments(
+    message: Message,
+    parameters: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    return {
+        name: _message_value(getattr(message, name), schema)
+        for name, schema in parameters.items()
+    }
+
+
+def generated_response_value(
+    value: Any,
+    schema: Mapping[str, Any],
+    *,
+    wrapped: bool,
+) -> Any:
+    converted = _python_value(value, schema)
+    return {"result": converted} if wrapped else converted
+
+
+def _message_value(value: Any, schema: Mapping[str, Any]) -> Any:
+    schema_type = schema.get("type")
+    if schema_type == "Struct":
+        return {
+            name: _message_value(getattr(value, name), child)
+            for name, child in dict(schema.get("properties", {})).items()
+        }
+    if schema_type == "List":
+        item = schema.get("items", {})
+        return [_message_value(element, item) for element in value]
+    if schema_type == "Date":
+        import datetime
+
+        return datetime.date(value.year, value.month, value.day)
+    if schema_type == "DatetimeTz":
+        import datetime
+
+        timezone = datetime.timezone(datetime.timedelta(minutes=value.offset_minutes))
+        return datetime.datetime.fromtimestamp(value.timestamp / 1000, timezone)
+    if schema_type == "Datetime":
+        import datetime
+
+        return datetime.datetime.fromtimestamp(value / 1000)
+    if schema_type == "Bytes":
+        return bytes(value)
+    return value
+
+
+def _python_value(value: Any, schema: Mapping[str, Any]) -> Any:
+    schema_type = schema.get("type")
+    if schema_type == "Struct":
+        if not isinstance(value, Mapping):
+            raise ProtobufContractError("handler result must be a mapping")
+        return {
+            name: _python_value(value[name], child)
+            for name, child in dict(schema.get("properties", {})).items()
+            if name in value
+        }
+    if schema_type == "List":
+        return [_python_value(element, schema.get("items", {})) for element in value]
+    if schema_type == "Date":
+        return {"year": value.year, "month": value.month, "day": value.day}
+    if schema_type in {"Datetime", "DatetimeTz"}:
+        import datetime
+
+        if not isinstance(value, datetime.datetime):
+            return value
+        timestamp = int(value.timestamp() * 1000)
+        if schema_type == "Datetime":
+            return timestamp
+        offset = value.utcoffset() or datetime.timedelta()
+        return {
+            "timestamp": timestamp,
+            "offset_minutes": int(offset.total_seconds() // 60),
+        }
+    if schema_type == "Bytes":
+        import base64
+
+        return base64.b64encode(bytes(value)).decode("ascii")
+    return value
 
 
 def load_grpc_codecs(

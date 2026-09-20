@@ -6,6 +6,7 @@ from pathlib import Path
 
 from pyscripts.runtime.compute import run_compute_task
 from pyscripts.runtime.loader import ArtifactArchiveCache
+from pyscripts.runtime.output import ExecutionOutcome
 
 
 def build_artifact(path: Path) -> str:
@@ -90,3 +91,37 @@ def test_artifact_archive_cache_survives_source_removal(tmp_path: Path) -> None:
 
     assert cache.obtain(artifact.as_uri(), digest) == cached
     assert hashlib.sha256(cached.read_bytes()).hexdigest() == digest
+
+
+def test_compute_task_returns_captured_output(tmp_path: Path) -> None:
+    artifact = tmp_path / "captured-compute.zip"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr(
+            "service.py",
+            "def run(value):\n"
+            "    print(f'computing {value}')\n"
+            "    return value * 2\n",
+        )
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+    result = run_compute_task(
+        transport="http",
+        cache_root=str(tmp_path / "captured-cache"),
+        environment_digest="captured-environment-v1",
+        service="captured-compute",
+        revision="rev-1",
+        endpoint_id="run",
+        context={},
+        payload={"value": 21},
+        artifact_uri=artifact.as_uri(),
+        artifact_digest=digest,
+        endpoint_manifest=[
+            {"id": "run", "task_type": "compute", "entrypoint": "service:run"}
+        ],
+        capture=True,
+    )
+
+    assert isinstance(result, ExecutionOutcome)
+    assert result.succeeded is True
+    assert result.value == 42
+    assert "computing 21" in "".join(chunk.content for chunk in result.logs)

@@ -16,6 +16,7 @@ from pyscripts.ray_client import ensure_ray
 from pyscripts.repository import ResolvedEndpoint
 from pyscripts.runtime.actor import UnifiedActor
 from pyscripts.runtime.compute import ComputeTask, ComputeTaskResult
+from pyscripts.runtime.output import ExecutionOutcome
 from pyscripts.storage import ArtifactStore, create_artifact_store
 
 
@@ -88,7 +89,7 @@ class ProfilePoolScheduler:
             target.endpoint_manifest,
         )
         try:
-            return await reference
+            return self._outcome(await reference)
         except BaseException:
             # If execute has not consumed the lease yet this releases it. If it is
             # already RUNNING, the actor owns release in its finally block.
@@ -100,7 +101,7 @@ class ProfilePoolScheduler:
         target: ResolvedEndpoint,
         request_id: uuid.UUID,
         payload: bytes,
-    ) -> bytes:
+    ) -> ExecutionOutcome:
         if target.task_type == "compute":
             result = await self._execute_compute(
                 target,
@@ -108,9 +109,10 @@ class ProfilePoolScheduler:
                 payload,
                 transport="grpc",
             )
-            if not isinstance(result, bytes):
+            outcome = self._outcome(result)
+            if outcome.succeeded and not isinstance(outcome.value, bytes):
                 raise TypeError("gRPC compute task returned a non-bytes result")
-            return result
+            return outcome
         artifact_uri = self.artifact_store.distribution_uri(target.artifact_uri)
         assignment = await self.reserve(target, request_id)
         reference = assignment.actor.execute_grpc.remote(
@@ -129,7 +131,11 @@ class ProfilePoolScheduler:
             target.endpoint_manifest,
         )
         try:
-            return await reference
+            result = await reference
+            outcome = self._outcome(result)
+            if outcome.succeeded and not isinstance(outcome.value, bytes):
+                raise TypeError("gRPC actor returned a non-bytes result")
+            return outcome
         except BaseException:
             assignment.actor.cancel_reservation.remote(assignment.lease_id)
             raise
@@ -269,13 +275,17 @@ class ProfilePoolScheduler:
                     if item["id"] == target.endpoint_id
                 ],
                 include_metadata=True,
+                capture=True,
+                invocation_log_max_bytes=self.settings.invocation_log_max_bytes,
+                invocation_log_chunk_bytes=self.settings.invocation_log_chunk_bytes,
+                capture_stderr=self.settings.capture_stderr,
             )
             result = await reference
             if isinstance(result, ComputeTaskResult):
                 self._remember_compute_warm_node(profile.key, result.node_id)
-                return result.value
+                return self._outcome(result.value)
             # Test doubles and older workers may still return the value directly.
-            return result
+            return self._outcome(result)
         except asyncio.CancelledError:
             if reference is not None:
                 ray.cancel(reference, force=True)
@@ -320,10 +330,40 @@ class ProfilePoolScheduler:
         await self._ensure_ray()
         lock = self._profile_locks.setdefault(runtime_profile, asyncio.Lock())
         async with lock:
+            await self._retire_legacy_actors(runtime_profile)
             await self._discover_actors(runtime_profile)
             current = self._actor_count(runtime_profile)
             for _ in range(current, self.settings.actor_replicas_per_profile):
                 await self._create_next_actor_unlocked(runtime_profile)
+
+    async def _retire_legacy_actors(self, runtime_profile: str) -> None:
+        """Drain and reclaim detached actors using an older wire protocol."""
+        digest = hashlib.sha256(runtime_profile.encode("utf-8")).hexdigest()[:20]
+        for replica in range(self.settings.actor_max_per_profile):
+            names = (
+                f"pyscripts-runtime-{digest}-{replica}",
+                f"pyscripts-runtime-v2-{digest}-{replica}",
+                f"pyscripts-runtime-v3-{digest}-{replica}",
+                f"pyscripts-runtime-v4-{digest}-{replica}",
+            )
+            for actor_name in names:
+                try:
+                    actor = ray.get_actor(
+                        actor_name,
+                        namespace=self.settings.ray_namespace,
+                    )
+                except ValueError:
+                    continue
+                try:
+                    await actor.drain_actor.remote()
+                    status = await actor.status.remote()
+                except RayError:
+                    continue
+                if (
+                    int(status.get("running_leases", 0)) == 0
+                    and int(status.get("reserved_leases", 0)) == 0
+                ):
+                    ray.kill(actor, no_restart=True)
 
     async def _create_next_actor(self, runtime_profile: str) -> Any | None:
         lock = self._profile_locks.setdefault(runtime_profile, asyncio.Lock())
@@ -366,6 +406,9 @@ class ProfilePoolScheduler:
                 str(self.settings.actor_cache_root / actor_name),
                 self.settings.actor_max_io,
                 self.settings.actor_lease_ttl_seconds,
+                self.settings.invocation_log_max_bytes,
+                self.settings.invocation_log_chunk_bytes,
+                self.settings.capture_stderr,
             )
         except ValueError:
             # Another gateway/controller may have won the named-actor race.
@@ -459,6 +502,13 @@ class ProfilePoolScheduler:
         return sum(profile == runtime_profile for profile, _ in self._actors)
 
     @staticmethod
+    def _outcome(value: Any) -> ExecutionOutcome:
+        """Normalize old workers and test doubles during rolling upgrades."""
+        if isinstance(value, ExecutionOutcome):
+            return value
+        return ExecutionOutcome(succeeded=True, value=value)
+
+    @staticmethod
     def _order_candidates(candidates: list[ActorCandidate]) -> list[ActorCandidate]:
         eligible = [
             item for item in candidates if item.status["state"] in {"SHARED_IO", "IDLE"}
@@ -475,4 +525,7 @@ class ProfilePoolScheduler:
     @staticmethod
     def _actor_name(runtime_profile: str, replica: int) -> str:
         digest = hashlib.sha256(runtime_profile.encode("utf-8")).hexdigest()[:20]
-        return f"pyscripts-runtime-{digest}-{replica}"
+        # Version the detached actor protocol. V5 resolves artifact-local
+        # absolute imports inside the current revision namespace.
+        # Older actors may finish in-flight work before they are reclaimed.
+        return f"pyscripts-runtime-v5-{digest}-{replica}"

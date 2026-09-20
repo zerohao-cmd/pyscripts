@@ -19,9 +19,18 @@ class UnifiedActor:
         cache_root: str,
         max_io: int = 100,
         lease_ttl_seconds: float = 15.0,
+        invocation_log_max_bytes: int = 64 * 1024,
+        invocation_log_chunk_bytes: int = 4 * 1024,
+        capture_stderr: bool = True,
     ):
         self.runtime_profile = runtime_profile
-        self.runtime = VersionedRuntime(Path(cache_root), max_io=max_io)
+        self.runtime = VersionedRuntime(
+            Path(cache_root),
+            max_io=max_io,
+            invocation_log_max_bytes=invocation_log_max_bytes,
+            invocation_log_chunk_bytes=invocation_log_chunk_bytes,
+            capture_stderr=capture_stderr,
+        )
         self.admission = AdmissionController(max_io, lease_ttl_seconds)
 
     async def try_reserve(
@@ -71,6 +80,7 @@ class UnifiedActor:
                 artifact_uri=artifact_uri,
                 artifact_digest=artifact_digest,
                 endpoints=endpoints,
+                capture=True,
             )
         finally:
             await self.admission.finish(lease_id)
@@ -84,7 +94,7 @@ class UnifiedActor:
         artifact_uri: str,
         artifact_digest: str,
         endpoint_manifest: list[dict[str, Any]],
-    ) -> bytes:
+    ) -> Any:
         lease = await self.admission.start(lease_id)
         try:
             endpoints = [
@@ -106,6 +116,7 @@ class UnifiedActor:
                 artifact_uri=artifact_uri,
                 artifact_digest=artifact_digest,
                 endpoints=endpoints,
+                capture=True,
             )
         finally:
             await self.admission.finish(lease_id)

@@ -5,9 +5,15 @@ import zipfile
 from pathlib import Path
 
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+from grpc_tools import protoc
 
+from pyscripts.contracts.generator import (
+    GENERATED_DESCRIPTOR_PATH,
+    generate_contract,
+)
 from pyscripts.runtime.loader import EndpointDefinition, VersionedRuntime
 from pyscripts.runtime.protobuf import GrpcEndpointDefinition
+from pyscripts.schemas import EndpointSpec
 
 
 def _contract() -> tuple[bytes, type, type]:
@@ -99,3 +105,86 @@ async def test_grpc_payload_is_decoded_and_encoded_inside_revision(
     result = response_type.FromString(payload)
     assert result.value == 21
     assert result.revision == "rev-1"
+
+
+async def test_generated_grpc_flattens_request_into_python_arguments(
+    tmp_path: Path,
+) -> None:
+    spec = EndpointSpec(
+        id="add",
+        task_type="compute",
+        entrypoint="service:add",
+        io_type=["rest", "grpc"],
+        parameters={"x": {"type": "Int64"}, "y": {"type": "Int64"}},
+        response_schema={"type": "Int64"},
+    )
+    generated = generate_contract("math-service", [spec])
+    assert generated is not None
+
+    proto_root = tmp_path / "proto"
+    proto_root.mkdir()
+    proto = proto_root / "service.proto"
+    proto.write_text(generated.proto_source, encoding="utf-8")
+    descriptor_path = tmp_path / "descriptor.pb"
+    assert protoc.main(
+        [
+            "grpc_tools.protoc",
+            f"-I{proto_root}",
+            f"--descriptor_set_out={descriptor_path}",
+            "service.proto",
+        ]
+    ) == 0
+    descriptor = descriptor_pb2.FileDescriptorSet.FromString(
+        descriptor_path.read_bytes()
+    )
+    pool = descriptor_pool.DescriptorPool()
+    for file_proto in descriptor.file:
+        pool.Add(file_proto)
+    request_type = message_factory.GetMessageClass(
+        pool.FindMessageTypeByName(f"{generated.package}.AddRequest")
+    )
+    response_type = message_factory.GetMessageClass(
+        pool.FindMessageTypeByName(f"{generated.package}.AddResponse")
+    )
+
+    artifact = tmp_path / "generated.zip"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr(
+            GENERATED_DESCRIPTOR_PATH,
+            descriptor_path.read_bytes(),
+        )
+        archive.writestr("service.py", "def add(x, y):\n    return x + y\n")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    generated_grpc = generated.endpoints[0].grpc
+    assert generated_grpc is not None
+    runtime = VersionedRuntime(tmp_path / "generated-cache")
+    endpoints = [
+        EndpointDefinition(
+            id="add",
+            task_type="compute",
+            entrypoint="service:add",
+            parameters=spec.parameters,
+            response_schema=spec.response_schema,
+            io_type=("rest", "grpc"),
+            grpc=GrpcEndpointDefinition(
+                service=generated_grpc.service,
+                method=generated_grpc.method,
+                descriptor_path=generated_grpc.descriptor_path,
+                generated=True,
+                response_wrapped=True,
+            ),
+        )
+    ]
+
+    payload = await runtime.execute_grpc(
+        "math-service",
+        "rev-1",
+        "add",
+        {"request_id": "request-1", "revision": "rev-1"},
+        request_type(x=7, y=5).SerializeToString(),
+        artifact_uri=artifact.as_uri(),
+        artifact_digest=digest,
+        endpoints=endpoints,
+    )
+
+    assert response_type.FromString(payload).result == 12

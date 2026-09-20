@@ -14,6 +14,7 @@ export type IconName =
   | "rocket"
   | "server"
   | "settings"
+  | "start"
   | "stop"
   | "x";
 
@@ -57,6 +58,8 @@ export const Icon: Component<{ name: IconName; size?: number }> = (props) => {
       return <svg {...common}><rect x="3" y="4" width="18" height="6" rx="2" /><rect x="3" y="14" width="18" height="6" rx="2" /><path d="M7 7h.01M7 17h.01M11 7h7M11 17h7" /></svg>;
     case "settings":
       return <svg {...common}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21h-4v-.1A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3v-4h.1A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.1A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.18.37.4.7.6 1 .3.4.7.6 1.1.6h.1v4h-.1A1.7 1.7 0 0 0 19.4 15Z" /></svg>;
+    case "start":
+      return <svg {...common}><path d="m8 5 11 7-11 7V5Z" /></svg>;
     case "stop":
       return <svg {...common}><rect x="5" y="5" width="14" height="14" rx="2" /></svg>;
     case "x":

@@ -2,6 +2,7 @@ import type {
   Contract,
   CreateServiceInput,
   Invocation,
+  InvocationLog,
   Revision,
   RuntimeLabel,
   RuntimeProfileInput,
@@ -95,11 +96,17 @@ export const api = {
     ),
   stopService: (serviceId: string) =>
     request<Service>(`/admin/services/${serviceId}/stop`, { method: "POST" }),
+  startService: (serviceId: string) =>
+    request<Service>(`/admin/services/${serviceId}/start`, { method: "POST" }),
   invocations: (limit = 100) =>
     request<Invocation[]>(`/admin/invocations?limit=${limit}`),
   serviceInvocations: (serviceId: string, limit = 100) =>
     request<Invocation[]>(
       `/admin/services/${serviceId}/invocations?limit=${limit}`,
+    ),
+  invocationLogs: (invocationId: string, afterSequence = -1) =>
+    request<InvocationLog[]>(
+      `/admin/invocations/${invocationId}/logs?after_sequence=${afterSequence}`,
     ),
   contract: (serviceName: string) =>
     request<Contract>(`/v1/services/${serviceName}/grpc-contract`),

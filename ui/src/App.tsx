@@ -16,6 +16,7 @@ import type {
   Contract,
   CreateServiceInput,
   Invocation,
+  InvocationLog,
   Revision,
   RuntimeLabel,
   RuntimeProfileInput,
@@ -67,10 +68,20 @@ function duration(invocation: Invocation): string {
   return `${(elapsed / 1000).toFixed(elapsed < 10_000 ? 2 : 1)} s`;
 }
 
+function formatLogTime(value: string): string {
+  const date = new Date(value);
+  return `${date.toLocaleTimeString("zh-CN", { hour12: false })}.${String(date.getMilliseconds()).padStart(3, "0")}`;
+}
+
+function logContent(value: string): string {
+  return value.replace(/\r?\n$/, "");
+}
+
 const endpointMetadataFields = new Set([
   "id",
   "task_type",
   "entrypoint",
+  "io_type",
   "response_schema",
   "grpc",
   "num_cpus",
@@ -417,7 +428,7 @@ const PublishRevisionModal: Component<{
         </div>
         <div class="banner">
           <strong>上线前校验</strong>
-          <span>自动读取 pyproject.toml 的环境标签、Python 版本、依赖和接口定义；全部兼容后才激活。</span>
+          <span>自动读取 pyproject.toml 并完成兼容性校验；运行中的服务自动切换，已停止服务只生成 READY revision。</span>
         </div>
         <Show when={error()}><div class="form-error">{error()}</div></Show>
         <footer class="modal__footer">
@@ -431,7 +442,11 @@ const PublishRevisionModal: Component<{
   );
 };
 
-const InvocationTable: Component<{ invocations: Invocation[]; compact?: boolean }> = (props) => (
+const InvocationTable: Component<{
+  invocations: Invocation[];
+  compact?: boolean;
+  onSelect: (invocation: Invocation) => void;
+}> = (props) => (
   <Show
     when={props.invocations.length > 0}
     fallback={<EmptyState icon="activity" title="还没有调用记录" detail="服务被调用后，状态和耗时会显示在这里。" />}
@@ -442,12 +457,12 @@ const InvocationTable: Component<{ invocations: Invocation[]; compact?: boolean 
         <tbody>
           <For each={props.compact ? props.invocations.slice(0, 7) : props.invocations}>
             {(item) => (
-              <tr>
+              <tr class="is-clickable" onClick={() => props.onSelect(item)}>
                 <td><StatusBadge value={item.status} /></td>
                 <td><strong>{item.service}</strong><span class="cell-sub mono">{item.endpoint_id} · {item.execution_kind ?? "LEGACY"}</span></td>
                 <td class="mono muted">{shortId(item.revision, 14)}</td>
                 <td class="mono">{duration(item)}</td>
-                <td class="muted">{formatDate(item.created_at)}</td>
+                <td class="muted">{formatDate(item.created_at)}<Show when={item.has_logs}><span class="cell-sub log-available">{item.log_bytes} B logs</span></Show></td>
               </tr>
             )}
           </For>
@@ -455,6 +470,34 @@ const InvocationTable: Component<{ invocations: Invocation[]; compact?: boolean 
       </table>
     </div>
   </Show>
+);
+
+const InvocationLogModal: Component<{
+  invocation: Invocation;
+  logs: InvocationLog[];
+  loading: boolean;
+  error: string;
+  onClose: () => void;
+}> = (props) => (
+  <Modal eyebrow={`${props.invocation.service} / ${props.invocation.endpoint_id}`} title="调用输出" onClose={props.onClose}>
+    <div class="invocation-log-detail">
+      <div class="invocation-log-meta">
+        <div><span>状态</span><StatusBadge value={props.invocation.status} /></div>
+        <div><span>Request ID</span><code>{props.invocation.id}</code></div>
+        <div><span>耗时</span><strong class="mono">{duration(props.invocation)}</strong></div>
+        <div><span>输出大小</span><strong class="mono">{props.invocation.log_bytes} B</strong></div>
+      </div>
+      <Show when={props.invocation.error}><div class="form-error">{props.invocation.error}</div></Show>
+      <Show when={props.invocation.logs_truncated}><div class="banner banner--danger"><strong>日志已截断</strong><span>本次输出超过服务端单次调用上限，只保存了前 {props.invocation.log_bytes} 字节。</span></div></Show>
+      <Show when={!props.loading} fallback={<div class="log-console log-console--empty">正在读取日志…</div>}>
+        <Show when={!props.error} fallback={<div class="form-error">{props.error}</div>}>
+          <Show when={props.logs.length > 0} fallback={<div class="log-console log-console--empty">本次调用没有捕获到 Python 标准输出。</div>}>
+            <pre class="log-console"><For each={props.logs}>{(log) => <span classList={{ "log-line": true, "log-line--stderr": log.stream === "STDERR" }} data-stream={log.stream}><time>{formatLogTime(log.emitted_at)}</time><span>{logContent(log.content)}</span></span>}</For></pre>
+          </Show>
+        </Show>
+      </Show>
+    </div>
+  </Modal>
 );
 
 const App: Component = () => {
@@ -479,6 +522,10 @@ const App: Component = () => {
   const [showRuntimeModal, setShowRuntimeModal] = createSignal(false);
   const [runtimeModalLabel, setRuntimeModalLabel] = createSignal<RuntimeLabel | null>(null);
   const [toast, setToast] = createSignal<Toast | null>(null);
+  const [selectedInvocation, setSelectedInvocation] = createSignal<Invocation | null>(null);
+  const [invocationLogs, setInvocationLogs] = createSignal<InvocationLog[]>([]);
+  const [invocationLogsLoading, setInvocationLogsLoading] = createSignal(false);
+  const [invocationLogsError, setInvocationLogsError] = createSignal("");
 
   const selectedService = createMemo(() =>
     services().find((service) => service.id === selectedId()),
@@ -575,6 +622,20 @@ const App: Component = () => {
     setView("services");
   };
 
+  const openInvocation = async (invocation: Invocation) => {
+    setSelectedInvocation(invocation);
+    setInvocationLogs([]);
+    setInvocationLogsError("");
+    setInvocationLogsLoading(true);
+    try {
+      setInvocationLogs(await api.invocationLogs(invocation.id));
+    } catch (error) {
+      setInvocationLogsError(errorMessage(error));
+    } finally {
+      setInvocationLogsLoading(false);
+    }
+  };
+
   const activate = async (revision: Revision) => {
     const service = selectedService();
     if (!service || !window.confirm(`激活 revision ${revision.revision}？新请求将立即切换。`)) return;
@@ -593,6 +654,18 @@ const App: Component = () => {
     try {
       await api.stopService(service.id);
       notify(`${service.name} 已停止`);
+      await load(true);
+    } catch (error) {
+      notify(errorMessage(error), "danger");
+    }
+  };
+
+  const start = async () => {
+    const service = selectedService();
+    if (!service || !window.confirm(`启动 ${service.name}？将恢复当前 active revision。`)) return;
+    try {
+      await api.startService(service.id);
+      notify(`${service.name} 已启动`);
       await load(true);
     } catch (error) {
       notify(errorMessage(error), "danger");
@@ -702,7 +775,7 @@ const App: Component = () => {
 
               <article class="panel panel--activity">
                 <header class="panel__header"><div><span class="eyebrow">LIVE LOG</span><h2>最近调用</h2></div><button class="text-button" onClick={() => setView("activity")}>完整记录 <Icon name="chevron" size={15} /></button></header>
-                <InvocationTable invocations={invocations()} compact />
+                <InvocationTable invocations={invocations()} compact onSelect={(item) => void openInvocation(item)} />
               </article>
             </section>
           </Show>
@@ -730,6 +803,7 @@ const App: Component = () => {
                         <div><div class="service-hero__title"><h2>{service.name}</h2><StatusBadge value={service.status} /></div><p><Icon name="git" size={15} />{service.git_url}</p></div>
                         <div class="service-hero__actions">
                           <Show when={service.status === "ACTIVE"}><button class="button button--danger" onClick={() => void stop()}><Icon name="stop" />停止</button></Show>
+                          <Show when={service.status === "STOPPED" && service.active_revision_id}><button class="button button--primary" onClick={() => void start()}><Icon name="start" />启动</button></Show>
                           <button class="button button--outline" onClick={() => setShowServiceSettings(true)}><Icon name="settings" />设置</button>
                           <button class="button button--primary" onClick={() => setShowPublish(true)}><Icon name="rocket" />同步并发布</button>
                         </div>
@@ -750,12 +824,14 @@ const App: Component = () => {
                             <For each={serviceDetail()?.endpoints ?? []}>{(endpoint) => (
                               <article class="endpoint-card">
                                 <header><div><strong>{endpoint.id}</strong><span class="mono">{endpoint.entrypoint}</span></div><StatusBadge value={endpoint.task_type.toUpperCase()} /></header>
-                                <code>POST /v1/services/{service.name}/{endpoint.id}</code>
+                                <Show when={(endpoint.io_type ?? ["rest"]).includes("rest")}>
+                                  <code>POST /v1/services/{service.name}/{endpoint.id}</code>
+                                </Show>
                                 <div class="endpoint-card__meta">
                                   <span>参数</span>
                                   <strong class="mono">{endpointParameters(endpoint).join(", ") || "无"}</strong>
                                 </div>
-                                <Show when={endpoint.grpc}><div class="endpoint-card__meta"><span>gRPC</span><strong class="mono">{endpoint.grpc!.service}/{endpoint.grpc!.method}</strong></div></Show>
+                                <Show when={endpoint.grpc}><div class="endpoint-card__meta"><span>gRPC{endpoint.grpc!.generated ? " · AUTO" : ""}</span><strong class="mono">{endpoint.grpc!.service}/{endpoint.grpc!.method}</strong></div></Show>
                               </article>
                             )}</For>
                           </div>
@@ -801,7 +877,7 @@ const App: Component = () => {
 
                         <article class="panel service-calls">
                           <header class="panel__header"><div><span class="eyebrow">SERVICE LOG</span><h3>最近调用</h3></div><span>{serviceInvocations().length}</span></header>
-                          <InvocationTable invocations={serviceInvocations()} compact />
+                          <InvocationTable invocations={serviceInvocations()} compact onSelect={(item) => void openInvocation(item)} />
                         </article>
                       </section>
                     </>
@@ -873,7 +949,7 @@ const App: Component = () => {
           <Show when={view() === "activity"}>
             <section class="panel activity-panel">
               <header class="panel__header panel__header--large"><div><span class="eyebrow">LATEST 100</span><h2>全局调用流水</h2><p>请求状态来自 PostgreSQL invocation 记录。</p></div><div class="legend"><span><i class="legend__dot legend__dot--good" />成功</span><span><i class="legend__dot legend__dot--warn" />执行中</span><span><i class="legend__dot legend__dot--bad" />失败</span></div></header>
-              <InvocationTable invocations={invocations()} />
+              <InvocationTable invocations={invocations()} onSelect={(item) => void openInvocation(item)} />
             </section>
           </Show>
         </Show>
@@ -881,8 +957,9 @@ const App: Component = () => {
 
       <Show when={showCreateService()}><CreateServiceModal onClose={() => setShowCreateService(false)} onCreated={(service) => { setShowCreateService(false); setSelectedId(service.id); setView("services"); notify(`${service.name} 已注册`); void load(true); }} /></Show>
       <Show when={showServiceSettings() && selectedService()} keyed>{(service) => <ServiceSettingsModal service={service} onClose={() => setShowServiceSettings(false)} onUpdated={(updated) => { setShowServiceSettings(false); setServiceDetail(updated); setServices((items) => items.map((item) => item.id === updated.id ? updated : item)); notify(`${updated.name} 设置已保存`); void load(true); }} />}</Show>
-      <Show when={showPublish() && selectedService()} keyed>{(service) => <PublishRevisionModal service={service} onClose={() => setShowPublish(false)} onPublished={() => { setShowPublish(false); notify("Git revision 已构建并上线"); void load(true); }} />}</Show>
+      <Show when={showPublish() && selectedService()} keyed>{(service) => <PublishRevisionModal service={service} onClose={() => setShowPublish(false)} onPublished={() => { setShowPublish(false); notify(service.status === "STOPPED" ? "Git revision 已发布，服务仍保持停止" : "Git revision 已构建并上线"); void load(true); }} />}</Show>
       <Show when={showRuntimeModal()}><RuntimeProfileModal label={runtimeModalLabel()} workerPools={workerPools()} onClose={() => setShowRuntimeModal(false)} onCreated={(profile) => { setShowRuntimeModal(false); notify(profile.status === "FAILED" ? `${profile.profile_ref} 校验失败` : `${profile.profile_ref} 已通过校验`, profile.status === "FAILED" ? "danger" : "success"); void load(true); }} /></Show>
+      <Show when={selectedInvocation()} keyed>{(invocation) => <InvocationLogModal invocation={invocation} logs={invocationLogs()} loading={invocationLogsLoading()} error={invocationLogsError()} onClose={() => setSelectedInvocation(null)} />}</Show>
       <Show when={toast()} keyed>{(item) => <div class={`toast toast--${item.tone}`}><Icon name={item.tone === "success" ? "check" : "x"} /><span>{item.message}</span></div>}</Show>
     </div>
   );

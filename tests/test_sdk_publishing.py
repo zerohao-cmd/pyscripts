@@ -96,6 +96,40 @@ def _build_artifact(
     return artifact, hashlib.sha256(artifact.read_bytes()).hexdigest()
 
 
+def _build_generated_contract_artifact(tmp_path: Path) -> tuple[Path, str]:
+    pyproject = """[project]
+name = "auto-math"
+version = "1.0.0"
+requires-python = ">=3.12,<3.13"
+
+[tool.pyscript]
+spec_version = 1
+
+[tool.pyscript.runtime]
+label = "py312-test"
+
+[[tool.pyscript.endpoints]]
+id = "add"
+task_type = "compute"
+entrypoint = "service:add"
+io_type = ["rest", "grpc"]
+
+[tool.pyscript.endpoints.x]
+type = "Int64"
+
+[tool.pyscript.endpoints.y]
+type = "Int64"
+
+[tool.pyscript.endpoints.response_schema]
+type = "Int64"
+"""
+    artifact = tmp_path / "auto-math.zip"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr("pyproject.toml", pyproject)
+        archive.writestr("service.py", "def add(x, y):\n    return x + y\n")
+    return artifact, hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+
 def test_grpc_contract_automatically_publishes_reusable_python_sdk(
     tmp_path: Path,
 ) -> None:
@@ -158,6 +192,9 @@ def test_grpc_contract_automatically_publishes_reusable_python_sdk(
         assert contract["revision"] == "rev-1"
         assert contract["methods"] == ["/examples.math.v1.MathService/Add"]
         assert contract["python_sdk"]["package_name"] == "pyscripts-math-service-sdk"
+        assert contract["python_sdk"]["download_url"].endswith(
+            "pyscripts_math_service_sdk-1.0.0-py3-none-any.whl"
+        )
 
         wheel_response = client.get(contract["python_sdk"]["download_url"])
         assert wheel_response.status_code == 200
@@ -197,4 +234,108 @@ def test_grpc_contract_automatically_publishes_reusable_python_sdk(
         assert activation.status_code == 200
         second_contract = client.get("/v1/services/math-service/grpc-contract").json()
         assert second_contract["id"] == contract["id"]
+        assert second_contract["revision"] == "rev-2"
+
+
+def test_interface_metadata_generates_proto_and_python_sdk(tmp_path: Path) -> None:
+    artifact, digest = _build_generated_contract_artifact(tmp_path)
+    app = create_app(
+        Settings(
+            database_url=SecretStr(f"sqlite+aiosqlite:///{tmp_path / 'auto.db'}"),
+            contract_artifact_root=tmp_path / "contracts-auto",
+            artifact_store_root=tmp_path / "artifacts-auto",
+            grpc_host="127.0.0.1",
+            grpc_port=0,
+            ray_use_label_selector=False,
+            require_registered_runtime_profiles=False,
+        )
+    )
+
+    with TestClient(app) as client:
+        service = client.post(
+            "/admin/services",
+            json={
+                "name": "auto-math",
+                "git_url": "https://example.invalid/auto-math.git",
+            },
+        ).json()
+        response = client.post(
+            f"/admin/services/{service['id']}/revisions/import",
+            json={
+                "revision": "rev-1",
+                "artifact_uri": artifact.as_uri(),
+                "artifact_digest": digest,
+            },
+        )
+        assert response.status_code == 201, response.text
+        revision = response.json()
+        detail = client.get(f"/admin/services/{service['id']}").json()
+        endpoint = detail["endpoints"][0]
+        assert endpoint["io_type"] == ["rest", "grpc"]
+        assert endpoint["grpc"]["generated"] is True
+
+        activation = client.post(
+            f"/admin/services/{service['id']}/revisions/{revision['id']}/activate"
+        )
+        assert activation.status_code == 200, activation.text
+        contract_response = client.get("/v1/services/auto-math/grpc-contract")
+        assert contract_response.status_code == 200, contract_response.text
+        contract = contract_response.json()
+        assert contract["contract_version"] == "1.0.0"
+        assert contract["methods"] == [
+            "/pyscripts.generated.auto_math.v1.AutoMathService/Add"
+        ]
+
+        proto_response = client.get(contract["proto_bundle_url"])
+        assert proto_response.status_code == 200
+        proto_bundle = tmp_path / "auto-proto.zip"
+        proto_bundle.write_bytes(proto_response.content)
+        with zipfile.ZipFile(proto_bundle) as archive:
+            proto_name = next(
+                name for name in archive.namelist() if name.endswith("/service.proto")
+            )
+            proto_source = archive.read(proto_name).decode()
+        assert "rpc Add(AddRequest) returns (AddResponse);" in proto_source
+        assert "int64 x = 1;" in proto_source
+        assert "int64 y = 2;" in proto_source
+
+        wheel_response = client.get(contract["python_sdk"]["download_url"])
+        assert wheel_response.status_code == 200
+        wheel = tmp_path / "auto-sdk.whl"
+        wheel.write_bytes(wheel_response.content)
+        with zipfile.ZipFile(wheel) as archive:
+            names = set(archive.namelist())
+        assert "service_pb2.py" not in names
+        assert (
+            "pyscripts_auto_math_sdk_proto/v1/service_pb2.py" in names
+        )
+        sys.path.insert(0, str(wheel))
+        try:
+            sdk = importlib.import_module("pyscripts_auto_math_sdk")
+            request = sdk.AddRequest(x=2, y=3)
+            assert request.x == 2
+            assert request.y == 3
+            assert sdk.AutoMathServiceStub is not None
+        finally:
+            sys.path.remove(str(wheel))
+            for module_name in list(sys.modules):
+                if module_name == "pyscripts_auto_math_sdk" or module_name.startswith(
+                    "pyscripts_auto_math_sdk_proto"
+                ):
+                    sys.modules.pop(module_name, None)
+
+        second = client.post(
+            f"/admin/services/{service['id']}/revisions/import",
+            json={
+                "revision": "rev-2",
+                "artifact_uri": artifact.as_uri(),
+                "artifact_digest": digest,
+            },
+        )
+        assert second.status_code == 201, second.text
+        second_contract = client.get(
+            "/v1/services/auto-math/grpc-contract"
+        ).json()
+        assert second_contract["id"] == contract["id"]
+        assert second_contract["contract_version"] == "1.0.0"
         assert second_contract["revision"] == "rev-2"

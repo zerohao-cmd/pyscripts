@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     actor_scheduler_poll_seconds: float = Field(default=0.05, gt=0)
     actor_cache_root: Path = Path("/tmp/pyscripts-runtime")
     invocation_timeout_seconds: float = Field(default=300.0, gt=0)
+    invocation_log_max_bytes: int = Field(default=64 * 1024, ge=1024)
+    invocation_log_chunk_bytes: int = Field(default=4 * 1024, ge=256)
+    capture_stderr: bool = True
     compute_task_num_cpus: float = Field(default=1.0, gt=0)
     compute_task_num_gpus: float = Field(default=0.0, ge=0)
     compute_max_pending_per_profile: int = Field(default=64, ge=1)

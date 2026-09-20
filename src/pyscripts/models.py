@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     JSON,
     DateTime,
     Enum,
@@ -373,6 +374,34 @@ class InvocationExecution(Base):
     execution_kind: Mapped[ExecutionKind] = mapped_column(
         Enum(ExecutionKind, native_enum=False)
     )
+    log_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    logs_truncated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class InvocationLog(Base):
+    __tablename__ = "invocation_logs"
+    __table_args__ = (
+        UniqueConstraint(
+            "invocation_id", "sequence", name="uq_invocation_log_sequence"
+        ),
+        Index("ix_invocation_logs_invocation_sequence", "invocation_id", "sequence"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    invocation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("invocations.id", ondelete="CASCADE"), index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer)
+    stream: Mapped[str] = mapped_column(String(16))
+    content: Mapped[str] = mapped_column(Text)
+    emitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

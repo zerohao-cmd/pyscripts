@@ -2,7 +2,8 @@
 
 本文定义 pyscripts 业务 Artifact 的接口元信息格式。接口配置位于
 `pyproject.toml` 的 `[tool.pyscript]` 命名空间中，用于描述入口函数、
-请求与返回结构、执行类型以及可选的 gRPC 契约。
+请求与返回结构、执行类型以及允许的调用协议。gRPC 的 Proto、Descriptor 和 SDK
+由平台生成，不需要业务仓库维护。
 
 manager 检测到 Git 提交变化后，直接读取该提交的 `pyproject.toml`。只有环境与
 接口校验全部通过，才会从相同提交自动生成 Revision 和 Artifact，并将本文结构
@@ -160,7 +161,7 @@ Revision，也不上传 Artifact。相同 commit SHA 已经处理过时必须保
 3. 标签的 Python 版本必须满足 `[project].requires-python`；
 4. 对 `[project].dependencies` 中的每个 PEP 508 Requirement，标签环境中的已解析
    包版本必须满足 Specifier 和适用的 marker；
-5. 接口元数据、入口格式和可选 gRPC 契约必须有效。
+5. 接口元数据、入口格式和 gRPC 可生成性必须有效。
 
 任一步失败时，将该 Git 提交记录为构建失败并展示具体原因；不得生成 Revision、
 不得上传 Artifact，也不得影响当前活动 Revision。
@@ -227,7 +228,7 @@ Content-Type: application/json
 | `spec_version` | integer | 是 | 本文格式版本，当前固定为 `1`。 |
 | `runtime` | table | 是 | 当前 Git 提交引用的逻辑 Runtime Label。 |
 | `endpoints` | array of tables | 是 | 使用 `[[tool.pyscript.endpoints]]` 声明，至少一个。 |
-| `grpc_contract` | table | 否 | Revision 存在 gRPC 接口时必填。 |
+| `grpc_contract` | table | 否 | 仅供旧版手写 Proto 兼容模式使用；新服务不要声明。 |
 
 服务名称、Git 地址和跟踪方式属于 WebUI 注册信息，不在此处重复定义。
 
@@ -253,10 +254,11 @@ Revision 的 `requires-python` 和 `dependencies` 重新校验；全部兼容才
 | `id` | string | 是 | Revision 内唯一的接口 ID，同时构成 HTTP 路径。 |
 | `task_type` | string | 是 | 只能是 `io` 或 `compute`。 |
 | `entrypoint` | string | 是 | 格式为 `模块路径:函数名`，相对于 Artifact 根目录。 |
+| `io_type` | array of string | 否 | 可包含 `rest`、`grpc`；默认 `["rest"]`。 |
 | `response_schema` | table | 否 | HTTP 返回值结构；省略时为空对象。 |
 | `num_cpus` | float | 否 | 单个 Compute Task 申请的 CPU，只允许用于 `compute`。 |
 | `num_gpus` | float | 否 | 单个 Compute Task 申请的 GPU，只允许用于 `compute`。 |
-| `grpc` | table | 否 | 原生 gRPC 方法映射。 |
+| `grpc` | table | 否 | 仅供旧版手写 Proto 兼容模式使用。 |
 
 除上述保留字段外，endpoint 下的直接子表就是同名 Python 函数参数。例如
 `[tool.pyscript.endpoints.x]` 对应 `function(..., x=...)`。参数名必须是合法的
@@ -380,66 +382,57 @@ type = "String"
 
 ## gRPC 接口
 
-Revision 包含 gRPC endpoint 时，需要同时声明一个 Revision 级契约，以及每个
-endpoint 对应的原生 gRPC method。
+在 endpoint 的 `io_type` 中加入 `grpc` 即可。系统使用同一份展平参数与
+`response_schema` 自动生成 Proto，不要求用户编写 `.proto`、Descriptor 或版本号。
 
 ```toml
-[tool.pyscript]
-spec_version = 1
-
-[tool.pyscript.grpc_contract]
-version = "1.0.0"
-proto_root = "proto"
-package_name = "orders-client"
-
 [[tool.pyscript.endpoints]]
 id = "create_order"
 task_type = "io"
 entrypoint = "orders:create_order"
+io_type = ["rest", "grpc"]
 
-[tool.pyscript.endpoints.grpc]
-service = "examples.orders.v1.OrderService"
-method = "CreateOrder"
-descriptor_path = "descriptor.pb"
+[tool.pyscript.endpoints.order]
+type = "Struct"
+required = ["customer_id", "items"]
+additionalProperties = false
+
+[tool.pyscript.endpoints.order.properties.customer_id]
+type = "String"
+
+[tool.pyscript.endpoints.order.properties.items]
+type = "List"
+
+[tool.pyscript.endpoints.order.properties.items.items]
+type = "String"
+
+[tool.pyscript.endpoints.response_schema]
+type = "Struct"
+required = ["order_id"]
+additionalProperties = false
+
+[tool.pyscript.endpoints.response_schema.properties.order_id]
+type = "String"
 ```
 
-字段说明：
-
-| 字段 | 位置 | 说明 |
-| --- | --- | --- |
-| `version` | `grpc_contract` | SDK/契约版本，必须是有效的 Python 包版本。 |
-| `proto_root` | `grpc_contract` | Artifact 内原始 `.proto` 文件目录，默认 `proto`。 |
-| `package_name` | `grpc_contract` | 生成的 Python SDK 包名；可省略。 |
-| `service` | endpoint `grpc` | 完整 Protobuf 服务名，必须包含 package。 |
-| `method` | endpoint `grpc` | Protobuf 方法名。 |
-| `descriptor_path` | endpoint `grpc` | Artifact 内的 `FileDescriptorSet`，默认 `descriptor.pb`。 |
-
-当前 gRPC 约束：
-
-- 只支持 unary-unary；
-- 同一 Revision 内的 gRPC method path 必须唯一；
-- 同一 Revision 的所有 gRPC endpoint 必须使用同一个 descriptor；
-- Artifact 必须同时包含原始 Proto 目录和 `descriptor.pb`；
-- 破坏性 Schema 更新应使用新的 Protobuf package、service 版本或 method；
-- Schema 改变时必须提升 `grpc_contract.version`。
-
-生成 descriptor：
-
-```bash
-protoc -I proto \
-  --include_imports \
-  --descriptor_set_out=descriptor.pb \
-  proto/orders.proto
-```
-
-gRPC 不使用 HTTP 的展平参数对象。原生 gRPC endpoint 不应声明 `x`、`y` 等
-参数子表，其入口接收动态生成的请求 Message 作为唯一业务位置参数，可以返回响应
-Message、序列化后的 bytes，或与响应 Message 兼容的 mapping：
+REST 请求会使用 `{"order": ...}` 作为 JSON body；gRPC SDK 则提供展开后的
+`CreateOrderRequest.order` 字段。两条协议最终都调用同一个 Python 签名：
 
 ```python
-async def create_order(request):
-    return {"order_id": f"order-{request.customer_id}"}
+async def create_order(order: dict) -> dict:
+    return {"order_id": f"order-{order['customer_id']}"}
 ```
+
+自动生成规则：
+
+- 首次发布按字段名确定稳定编号；后续发布从上一份 Descriptor 继承编号；
+- 参数顺序变化不会改变 Proto；字段删除或类型变化会保留旧编号和字段名为
+  `reserved`，不会被后续字段复用；
+- 接口不变时 Descriptor 字节保持一致，复用原有契约与 SDK；
+- 破坏性变化自动提升 major，兼容变化自动提升 minor，用户不填写契约版本；
+- 标量返回值在生成的 Response 中使用 `result` 字段；`Struct` 返回值保持其字段；
+- 当前只支持 unary-unary；用于 gRPC 的 `Struct` 必须设置
+  `additionalProperties = false`，且暂不支持嵌套 `List[List[...]]`。
 
 Revision 激活后可以获取契约与自动生成的 Python SDK：
 
@@ -447,26 +440,27 @@ Revision 激活后可以获取契约与自动生成的 Python SDK：
 GET /v1/services/{service_name}/grpc-contract
 GET /v1/contracts/{contract_id}/descriptor.pb
 GET /v1/contracts/{contract_id}/proto.zip
-GET /v1/contracts/{contract_id}/python-sdk
+GET /v1/contracts/{contract_id}/python-sdk/{generated-wheel-name}.whl
 ```
 
 客户端使用生成包中的标准 protobuf Message 和 Stub 调用，不需要调用通用
 `Invoke(bytes)` 接口，也不需要手动序列化请求或响应。
+
+已有的手写 Proto 服务仍可通过 `grpc_contract` 和 endpoint `grpc` 字段运行，
+但它属于兼容模式，不能与自动生成模式混用，新服务应只使用 `io_type`。
 
 ## Artifact 目录示例
 
 ```text
 orders-service.zip
 ├── pyproject.toml
-├── orders.py
-├── descriptor.pb
-└── proto/
-    └── orders.proto
+└── orders.py
 ```
 
 `entrypoint = "orders:create_order"` 对应 Artifact 根目录中的 `orders.py`。
 包内模块可以使用 `package.module:function`，例如
-`entrypoint = "src.orders:create_order"`。
+`entrypoint = "src.orders:create_order"`。平台发布时会把生成的 Proto 和 Descriptor
+加入最终的不可变 Artifact；Git 仓库不需要包含它们。
 
 ## 完整示例
 
@@ -485,15 +479,11 @@ spec_version = 1
 [tool.pyscript.runtime]
 label = "orders-default"
 
-[tool.pyscript.grpc_contract]
-version = "2.1.0"
-proto_root = "proto"
-package_name = "orders-client"
-
 [[tool.pyscript.endpoints]]
 id = "calculate_total"
 task_type = "compute"
 entrypoint = "orders:calculate_total"
+io_type = ["rest", "grpc"]
 num_cpus = 1.0
 
 [tool.pyscript.endpoints.prices]
@@ -509,11 +499,23 @@ type = "Double"
 id = "create_order"
 task_type = "io"
 entrypoint = "orders:create_order"
+io_type = ["grpc"]
 
-[tool.pyscript.endpoints.grpc]
-service = "examples.orders.v2.OrderService"
-method = "CreateOrder"
-descriptor_path = "descriptor.pb"
+[tool.pyscript.endpoints.order]
+type = "Struct"
+required = ["customer_id"]
+additionalProperties = false
+
+[tool.pyscript.endpoints.order.properties.customer_id]
+type = "String"
+
+[tool.pyscript.endpoints.response_schema]
+type = "Struct"
+required = ["order_id"]
+additionalProperties = false
+
+[tool.pyscript.endpoints.response_schema.properties.order_id]
+type = "String"
 ```
 
 ## 发布校验规则
@@ -528,8 +530,9 @@ manager 解析并发布 Revision 时应执行以下校验：
 6. `entrypoint` 必须符合 `module:function` 格式；
 7. `task_type` 只能是 `io` 或 `compute`；
 8. `num_cpus` 和 `num_gpus` 只能用于 Compute endpoint；
-9. gRPC endpoint 必须存在 `grpc_contract`；
-10. gRPC service/method、Proto 源文件和 descriptor 必须一致；
+9. `io_type` 只能包含 `rest`、`grpc`，且 gRPC endpoint 必须声明
+   `response_schema`；
+10. 自动生成的 Proto 必须可编译，字段编号必须能与上一份 Descriptor 稳定合并；
 11. 不接受 Worker Pool、Runtime Env、密钥或 Token 字段；
 12. 校验成功后，解析结果与自动生成的 Artifact digest 一起写入 Revision；代码与
     接口不可变，裸逻辑标签的已解析环境绑定允许兼容热替换。
@@ -545,7 +548,7 @@ manager 解析并发布 Revision 时应执行以下校验：
 | 提示 `request_schema is not supported` | 已改为展平参数；使用 `[tool.pyscript.endpoints.x]`。 |
 | HTTP 调用返回脚本执行失败 | 检查 JSON 键是否与函数参数名一致，并检查调用日志中的具体异常。 |
 | Worker 导入第三方包失败 | 检查构建记录中的依赖校验结果与实际 import 名称是否一致。 |
-| gRPC endpoint 提示不能声明展平参数 | gRPC 使用 Proto Request；移除 endpoint 下的 `x`、`y` 参数子表。 |
+| gRPC Struct 提示必须关闭额外字段 | 添加 `additionalProperties = false`，保证 Schema 能映射为固定 Proto 字段。 |
 | 激活返回 `409` | Revision 状态、服务状态或 gRPC SDK 尚不满足激活条件。 |
 
 ## 接入检查清单
@@ -558,7 +561,7 @@ manager 解析并发布 Revision 时应执行以下校验：
 - HTTP 参数名是合法 Python 参数名，并与函数签名一致；
 - IO/Compute 类型选择正确；
 - Runtime Label 的 Python 和第三方依赖满足项目约束；
-- gRPC Artifact 同时包含 Proto 源码和 `descriptor.pb`；
+- 需要 gRPC 的 endpoint 已在 `io_type` 中加入 `grpc` 并声明返回 Schema；
 - Git 同步构建成功并自动上线后再调用服务。
 
 早期设计稿中的 `[[tool.pyscript.api]]`、`type`、`entrance`、`params` 和拼写错误

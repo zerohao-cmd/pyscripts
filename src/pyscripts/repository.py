@@ -16,6 +16,7 @@ from pyscripts.models import (
     ExecutionKind,
     Invocation,
     InvocationExecution,
+    InvocationLog,
     InvocationStatus,
     OutboxEvent,
     Revision,
@@ -42,6 +43,7 @@ from pyscripts.runtime.profiles import (
     RuntimeProfileCompatibilityError,
     validate_project_compatibility,
 )
+from pyscripts.runtime.output import CapturedLogChunk
 
 class NotFoundError(LookupError):
     pass
@@ -71,6 +73,7 @@ class ResolvedEndpoint:
     runtime_profile_version_id: uuid.UUID | None = None
     num_cpus: float | None = None
     num_gpus: float | None = None
+    io_type: tuple[str, ...] = ("rest",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -535,6 +538,26 @@ class PlatformRepository:
             for invocation, service_name, revision, execution in rows
         ]
 
+    async def list_invocation_logs(
+        self,
+        invocation_id: uuid.UUID,
+        *,
+        after_sequence: int = -1,
+        limit: int = 500,
+    ) -> list[InvocationLog]:
+        if await self.session.get(Invocation, invocation_id) is None:
+            raise NotFoundError("invocation does not exist")
+        result = await self.session.scalars(
+            select(InvocationLog)
+            .where(
+                InvocationLog.invocation_id == invocation_id,
+                InvocationLog.sequence > after_sequence,
+            )
+            .order_by(InvocationLog.sequence)
+            .limit(limit)
+        )
+        return list(result)
+
     async def register_contract(
         self,
         service_id: uuid.UUID,
@@ -781,10 +804,12 @@ class PlatformRepository:
                 old_revision.status = RevisionStatus.DRAINING
 
         now = datetime.now(UTC)
+        service_was_stopped = service.status == ServiceStatus.STOPPED
         revision.status = RevisionStatus.ACTIVE
         revision.activated_at = now
         service.active_revision_id = revision.id
-        service.status = ServiceStatus.ACTIVE
+        if not service_was_stopped:
+            service.status = ServiceStatus.ACTIVE
         self.session.add(
             OutboxEvent(
                 topic="revision.activated",
@@ -805,7 +830,10 @@ class PlatformRepository:
         )
         if service is None:
             raise NotFoundError("service does not exist")
+        if service.status != ServiceStatus.ACTIVE:
+            raise InvalidTransitionError("only an active service can be stopped")
         service.status = ServiceStatus.STOPPED
+        service.updated_at = datetime.now(UTC)
         self.session.add(
             OutboxEvent(
                 topic="service.stopped",
@@ -814,6 +842,41 @@ class PlatformRepository:
             )
         )
         await self.session.flush()
+        await self.session.refresh(service)
+        return service
+
+    async def start_service(self, service_id: uuid.UUID) -> Service:
+        service = await self.session.scalar(
+            select(Service).where(Service.id == service_id).with_for_update()
+        )
+        if service is None:
+            raise NotFoundError("service does not exist")
+        if service.status != ServiceStatus.STOPPED:
+            raise InvalidTransitionError("only a stopped service can be started")
+        if service.active_revision_id is None:
+            raise InvalidTransitionError(
+                "service has no active revision; publish and activate one first"
+            )
+        revision = await self.session.get(Revision, service.active_revision_id)
+        if revision is None or revision.status != RevisionStatus.ACTIVE:
+            raise InvalidTransitionError(
+                "service active revision is unavailable; activate a ready revision first"
+            )
+        service.status = ServiceStatus.ACTIVE
+        service.updated_at = datetime.now(UTC)
+        self.session.add(
+            OutboxEvent(
+                topic="service.started",
+                aggregate_id=str(service.id),
+                payload={
+                    "service_id": str(service.id),
+                    "revision_id": str(revision.id),
+                    "revision": revision.revision,
+                },
+            )
+        )
+        await self.session.flush()
+        await self.session.refresh(service)
         return service
 
     async def get_active_contract(self, service_name: str) -> ContractBundle:
@@ -838,6 +901,17 @@ class PlatformRepository:
             raise NotFoundError("active gRPC contract does not exist")
         service, revision, contract, sdk = row
         return ContractBundle(service, contract, sdk, revision)
+
+    async def get_latest_contract(self, service_id: uuid.UUID) -> ApiContract | None:
+        return await self.session.scalar(
+            select(ApiContract)
+            .where(
+                ApiContract.service_id == service_id,
+                ApiContract.status == ContractStatus.READY,
+            )
+            .order_by(ApiContract.created_at.desc())
+            .limit(1)
+        )
 
     async def get_contract(self, contract_id: uuid.UUID) -> ContractBundle:
         row = (
@@ -943,6 +1017,7 @@ class PlatformRepository:
             runtime_profile_version_id=profile.id if profile else None,
             num_cpus=endpoint_spec.get("num_cpus"),
             num_gpus=endpoint_spec.get("num_gpus"),
+            io_type=tuple(endpoint_spec.get("io_type", ["rest"])),
         )
 
     async def begin_invocation(self, target: ResolvedEndpoint) -> Invocation:
@@ -998,6 +1073,10 @@ class PlatformRepository:
         invocation_id: uuid.UUID,
         status: InvocationStatus,
         error: str | None = None,
+        *,
+        logs: tuple[CapturedLogChunk, ...] = (),
+        log_bytes: int = 0,
+        logs_truncated: bool = False,
     ) -> None:
         invocation = await self.session.get(Invocation, invocation_id)
         if invocation is None:
@@ -1005,4 +1084,19 @@ class PlatformRepository:
         invocation.status = status
         invocation.error = error
         invocation.finished_at = datetime.now(UTC)
+        execution = await self.session.get(InvocationExecution, invocation_id)
+        if execution is not None:
+            execution.log_bytes = log_bytes
+            execution.logs_truncated = logs_truncated
+        if logs:
+            self.session.add_all(
+                InvocationLog(
+                    invocation_id=invocation_id,
+                    sequence=chunk.sequence,
+                    stream=chunk.stream,
+                    content=chunk.content,
+                    emitted_at=chunk.emitted_at,
+                )
+                for chunk in logs
+            )
         await self.session.flush()

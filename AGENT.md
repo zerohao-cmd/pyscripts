@@ -72,16 +72,17 @@ api server从manager那里获取到最新的接口数据, 并且启动接口.  �
 详见`./data_design.md`
 
 ### gRPC动态接口
-1. 客户端使用业务proto生成的标准强类型Stub, 不直接调用`Invoke(bytes)`信封接口.
-2. api server启动时只注册一个固定的`GenericRpcHandler`, 根据原生gRPC method path查询不可变RouteRegistry快照.
-3. Gateway不解析业务消息, 将原始protobuf bytes透传到已经固定revision的actor.
-4. 每个revision携带`FileDescriptorSet`, actor使用revision独立的DescriptorPool完成请求解码与响应编码, 禁止注册到全局DescriptorPool.
-5. 路由切换后新请求使用新revision; 已匹配的请求继续持有旧路由, 直到inflight归零后释放旧代码和descriptor.
-6. 兼容schema更新可以保持method path; 破坏性更新必须使用新的protobuf包、服务版本或方法名.
-7. 当前落地范围为unary-unary; streaming需要分别实现对应的RpcMethodHandler并保持调用基数不变.
-8. gRPC revision必须携带原始proto目录、descriptor和contract version; 发布阶段校验三者一致.
-9. schema digest变化时自动生成不可变Python wheel; code revision变化但schema不变时复用已有SDK.
-10. 新契约的Python SDK未处于READY状态时禁止激活revision.
+1. 用户只在endpoint的`io_type`声明`grpc`; 平台根据展平参数与`response_schema`自动生成proto、descriptor和标准强类型Python SDK.
+2. 客户端使用生成的标准强类型Stub, 不直接调用`Invoke(bytes)`信封接口.
+3. api server启动时只注册一个固定的`GenericRpcHandler`, 根据原生gRPC method path查询不可变RouteRegistry快照.
+4. Gateway不解析业务消息, 将原始protobuf bytes透传到已经固定revision的IO Actor或Compute Task.
+5. 每个revision携带`FileDescriptorSet`, 执行器使用revision独立的DescriptorPool完成请求解码、展平参数调用与响应编码, 禁止注册到全局DescriptorPool.
+6. 路由切换后新请求使用新revision; 已匹配的请求继续持有旧路由, 直到inflight归零后释放旧代码和descriptor.
+7. 字段编号继承上一份descriptor; 删除或改类型的字段号和名称写入`reserved`. 兼容变化自动提升minor, 破坏性变化自动提升major并切换protobuf package版本.
+8. 当前落地范围为unary-unary; streaming需要分别实现对应的RpcMethodHandler并保持调用基数不变.
+9. 发布阶段自动把生成的proto和descriptor加入最终Artifact; 手写`grpc_contract`只作为旧服务兼容模式.
+10. schema digest变化时自动生成不可变Python wheel; code revision变化但schema不变时复用已有SDK.
+11. 新契约的Python SDK未处于READY状态时禁止激活revision.
 
 ## ray执行层
 k8s提供的ray执行集群
@@ -118,3 +119,7 @@ k8s提供的ray执行集群
 使用postgresql作为后端数据库.
 主要储存服务元信息, 例如服务注册信息, 当前服务checkpoint, apiserver会监控这部分数据调整api
 还有每个服务的调用记录, 例如调用参数, 中间的日志捕获(脚本中的print), 调用返回结果
+
+第一版日志捕获在业务执行期间通过 ContextVar 路由 Python stdout/stderr，执行结束后随
+ExecutionOutcome 一次性返回并分块写入 invocation_logs；异步 IO 请求之间必须隔离，
+Compute Task 使用同一结果协议。日志有单次调用字节上限并记录 truncated 状态，当前不提供实时流。

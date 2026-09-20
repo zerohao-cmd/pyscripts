@@ -58,6 +58,7 @@ ENDPOINT_METADATA_FIELDS = {
     "id",
     "task_type",
     "entrypoint",
+    "io_type",
     "response_schema",
     "grpc",
     "num_cpus",
@@ -151,6 +152,8 @@ def parse_interface_document(document: Mapping[str, Any]) -> RevisionInterfaceSp
             for name, value in endpoint.items()
             if name in ENDPOINT_METADATA_FIELDS
         }
+        if endpoint.get("grpc") is not None and "io_type" not in endpoint_metadata:
+            endpoint_metadata["io_type"] = ["grpc"]
         parameters: dict[str, dict[str, Any]] = {}
         for name, schema in endpoint.items():
             if name in ENDPOINT_METADATA_FIELDS:
