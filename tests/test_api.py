@@ -1,0 +1,307 @@
+from __future__ import annotations
+
+import hashlib
+import subprocess
+import zipfile
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+from pydantic import SecretStr
+
+from pyscripts.api import create_app
+from pyscripts.config import Settings
+
+
+class FakeArtifactStore:
+    def __init__(self) -> None:
+        self.published: list[tuple[str, str]] = []
+
+    def publish(self, source_uri: str, expected_digest: str) -> str:
+        self.published.append((source_uri, expected_digest))
+        return f"s3://pyscripts/sha256/{expected_digest}.zip"
+
+    def distribution_uri(self, stored_uri: str) -> str:
+        return stored_uri
+
+
+def build_artifact(
+    tmp_path: Path,
+    *,
+    name: str = "service",
+    task_type: str = "io",
+) -> tuple[Path, str]:
+    artifact = tmp_path / f"{name}.zip"
+    pyproject = (
+        "[project]\n"
+        f'name = "{name}"\n'
+        'version = "1.0.0"\n'
+        'requires-python = ">=3.12,<3.13"\n'
+        "\n[tool.pyscript]\n"
+        "spec_version = 1\n"
+        "\n[tool.pyscript.runtime]\n"
+        'label = "py312-test"\n'
+        "\n[[tool.pyscript.endpoints]]\n"
+        'id = "run"\n'
+        f'task_type = "{task_type}"\n'
+        'entrypoint = "service:run"\n'
+        "\n[tool.pyscript.endpoints.value]\n"
+        'type = "Int64"\n'
+        "\n[tool.pyscript.endpoints.response_schema]\n"
+        'type = "Int64"\n'
+    )
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr("pyproject.toml", pyproject)
+        archive.writestr("service.py", "def run(context, value): return value\n")
+    return artifact, hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+
+def test_control_plane_vertical_slice(tmp_path: Path) -> None:
+    database = tmp_path / "api.db"
+    artifact, digest = build_artifact(
+        tmp_path,
+        name="math-service",
+        task_type="compute",
+    )
+    app = create_app(
+        Settings(
+            database_url=SecretStr(f"sqlite+aiosqlite:///{database}"),
+            auto_create_schema=True,
+            ray_use_label_selector=False,
+            require_registered_runtime_profiles=False,
+            grpc_host="127.0.0.1",
+            grpc_port=0,
+        )
+    )
+
+    with TestClient(app) as client:
+        assert app.state.grpc_gateway.bound_port is not None
+        service_response = client.post(
+            "/admin/services",
+            json={
+                "name": "math-service",
+                "git_url": "https://example.invalid/math.git",
+                "tracking_mode": "manual",
+            },
+        )
+        assert service_response.status_code == 201
+        service = service_response.json()
+        assert service["created_at"]
+
+        revision_response = client.post(
+            f"/admin/services/{service['id']}/revisions/import",
+            json={
+                "revision": "0123456789abcdef",
+                "artifact_uri": artifact.as_uri(),
+                "artifact_digest": digest,
+            },
+        )
+        assert revision_response.status_code == 201
+        revision = revision_response.json()
+        assert revision["status"] == "ACTIVE"
+
+        activation_response = client.post(
+            f"/admin/services/{service['id']}/revisions/{revision['id']}/activate"
+        )
+        assert activation_response.status_code == 200
+        assert activation_response.json()["status"] == "ACTIVE"
+
+        services = client.get("/admin/services")
+        assert services.status_code == 200
+        assert services.json()[0]["active_revision_id"] == revision["id"]
+
+        revisions = client.get(f"/admin/services/{service['id']}/revisions")
+        assert revisions.status_code == 200
+        assert revisions.json()[0]["revision"] == "0123456789abcdef"
+        assert revisions.json()[0]["endpoints"][0]["task_type"] == "compute"
+        endpoint = revisions.json()[0]["endpoints"][0]
+        assert endpoint["value"] == {"type": "Int64"}
+        assert "request_schema" not in endpoint
+
+        detail = client.get(f"/admin/services/{service['id']}")
+        assert detail.status_code == 200
+        assert detail.json()["revision_count"] == 1
+        assert detail.json()["active_revision"]["id"] == revision["id"]
+        assert detail.json()["endpoints"][0]["id"] == "run"
+
+        missing_interval = client.patch(
+            f"/admin/services/{service['id']}",
+            json={"tracking_mode": "poll"},
+        )
+        assert missing_interval.status_code == 422
+        updated = client.patch(
+            f"/admin/services/{service['id']}",
+            json={
+                "tracking_mode": "poll",
+                "check_interval_seconds": 90,
+                "git_url": "https://example.invalid/math-v2.git",
+            },
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["tracking_mode"] == "poll"
+        assert updated.json()["check_interval_seconds"] == 90
+        assert updated.json()["git_url"].endswith("math-v2.git")
+        assert updated.json()["endpoints"][0]["id"] == "run"
+
+        manual = client.patch(
+            f"/admin/services/{service['id']}",
+            json={"tracking_mode": "manual"},
+        )
+        assert manual.status_code == 200
+        assert manual.json()["check_interval_seconds"] is None
+
+        invocations = client.get("/admin/invocations")
+        assert invocations.status_code == 200
+        assert invocations.json() == []
+
+        service_invocations = client.get(
+            f"/admin/services/{service['id']}/invocations"
+        )
+        assert service_invocations.status_code == 200
+        assert service_invocations.json() == []
+
+
+def test_ui_is_served_when_distribution_exists(tmp_path: Path) -> None:
+    database = tmp_path / "ui.db"
+    ui_dist = tmp_path / "ui-dist"
+    ui_dist.mkdir()
+    (ui_dist / "index.html").write_text(
+        "<!doctype html><title>pyscripts console</title>",
+        encoding="utf-8",
+    )
+    app = create_app(
+        Settings(
+            database_url=SecretStr(f"sqlite+aiosqlite:///{database}"),
+            auto_create_schema=True,
+            grpc_enabled=False,
+            ray_use_label_selector=False,
+            ui_dist_path=ui_dist,
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert "pyscripts console" in response.text
+
+
+def test_revision_persists_object_store_reference(tmp_path: Path) -> None:
+    artifact_store = FakeArtifactStore()
+    artifact, digest = build_artifact(tmp_path, name="stored-service")
+    app = create_app(
+        Settings(
+            database_url=SecretStr(f"sqlite+aiosqlite:///{tmp_path / 'store.db'}"),
+            grpc_enabled=False,
+            ray_use_label_selector=False,
+            require_registered_runtime_profiles=False,
+        ),
+        artifact_store=artifact_store,
+    )
+
+    with TestClient(app) as client:
+        service = client.post(
+            "/admin/services",
+            json={
+                "name": "stored-service",
+                "git_url": "https://example.invalid/stored.git",
+            },
+        ).json()
+        created = client.post(
+            f"/admin/services/{service['id']}/revisions/import",
+            json={
+                "revision": "rev-1",
+                "artifact_uri": artifact.as_uri(),
+                "artifact_digest": digest,
+            },
+        )
+        assert created.status_code == 201, created.text
+        revisions = client.get(
+            f"/admin/services/{service['id']}/revisions"
+        ).json()
+
+    assert artifact_store.published == [
+        (artifact.as_uri(), digest)
+    ]
+    assert revisions[0]["artifact_uri"] == (
+        f"s3://pyscripts/sha256/{digest}.zip"
+    )
+
+
+def test_manual_publish_builds_revision_from_git_head(tmp_path: Path) -> None:
+    repository = tmp_path / "source"
+    repository.mkdir()
+    pyproject = (
+        "[project]\n"
+        'name = "git-service"\n'
+        'version = "1.0.0"\n'
+        'requires-python = ">=3.12,<3.13"\n'
+        "dependencies = []\n"
+        "\n[tool.pyscript]\n"
+        "spec_version = 1\n"
+        "\n[tool.pyscript.runtime]\n"
+        'label = "py312-test@latest"\n'
+        "\n[[tool.pyscript.endpoints]]\n"
+        'id = "run"\n'
+        'task_type = "io"\n'
+        'entrypoint = "service:run"\n'
+    )
+    (repository / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    (repository / "service.py").write_text(
+        "def run(context): return 'ok'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    app = create_app(
+        Settings(
+            database_url=SecretStr(
+                f"sqlite+aiosqlite:///{tmp_path / 'git-sync.db'}"
+            ),
+            grpc_enabled=False,
+            ray_use_label_selector=False,
+            require_registered_runtime_profiles=False,
+            actor_cache_root=tmp_path / "cache",
+        )
+    )
+
+    with TestClient(app) as client:
+        service = client.post(
+            "/admin/services",
+            json={"name": "git-service", "git_url": str(repository)},
+        ).json()
+        first = client.post(f"/admin/services/{service['id']}/revisions")
+        assert first.status_code == 201, first.text
+        body = first.json()
+        assert body["revision"] == revision
+        assert body["status"] == "ACTIVE"
+        assert body["runtime_profile"] == "py312-test@latest"
+        stored = client.get(
+            f"/admin/services/{service['id']}/revisions"
+        ).json()[0]
+        assert stored["artifact_digest"]
+        assert Path(stored["artifact_uri"].removeprefix("file://")).is_file()
+
+        repeated = client.post(f"/admin/services/{service['id']}/revisions")
+        assert repeated.status_code == 201
+        assert repeated.json()["id"] == body["id"]

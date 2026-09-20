@@ -1,10 +1,13 @@
+.env
+.pytest_cache/
+.ruff_cache/
+.venv/
 # Python-generated files
 __pycache__/
-*.py[oc]
+*.py[cod]
 build/
 dist/
 wheels/
 *.egg-info
-
-# Virtual environments
-.venv
+ui/node_modules/
+ui/dist/

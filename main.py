@@ -1,12 +1,4 @@
-def func():
-    l= []
-    def inner(value: int):
-        l.append(value)
-        return l
-    return inner
+import uvicorn
 
-f = func()
-
-inner_l = list(map(f,  [1, 2, 3]))
-# 输出
-print(inner_l)
+if __name__ == "__main__":
+    uvicorn.run("pyscripts.api:app", host="0.0.0.0", port=8000)

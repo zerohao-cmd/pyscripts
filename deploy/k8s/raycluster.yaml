@@ -1,0 +1,158 @@
+# KubeRay 1.7 / Ray 2.58 execution cluster for pyscripts.
+#
+# Apply after installing the KubeRay operator:
+#   kubectl apply -f deploy/k8s/raycluster.yaml
+#
+# The control-plane deployment should use:
+#   PYSCRIPTS_RAY_ADDRESS=ray://pyscripts-ray-head-svc.pyscripts.svc.cluster.local:10001
+#   PYSCRIPTS_KUBERAY_CLUSTER_NAME=pyscripts-ray
+#   PYSCRIPTS_KUBERNETES_NAMESPACE=pyscripts
+#   PYSCRIPTS_RAY_WORKER_POOL_LABEL_KEY=pyscripts.worker-pool
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pyscripts
+---
+# Read-only identity for the pyscripts API/control-plane Pod. The RayCluster
+# itself is managed by the KubeRay operator's service account.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pyscripts-control-plane
+  namespace: pyscripts
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pyscripts-raycluster-reader
+  namespace: pyscripts
+rules:
+  - apiGroups: ["ray.io"]
+    resources: ["rayclusters"]
+    resourceNames: ["pyscripts-ray"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pyscripts-raycluster-reader
+  namespace: pyscripts
+subjects:
+  - kind: ServiceAccount
+    name: pyscripts-control-plane
+    namespace: pyscripts
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pyscripts-raycluster-reader
+---
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: pyscripts-ray
+  namespace: pyscripts
+  labels:
+    app.kubernetes.io/name: pyscripts-ray
+    app.kubernetes.io/part-of: pyscripts
+spec:
+  rayVersion: "2.58.0"
+
+  # Autoscaler v2 understands Ray label selectors and can scale a worker group
+  # from its declared labels before a matching worker is running.
+  enableInTreeAutoscaling: true
+  autoscalerOptions:
+    version: v2
+    upscalingMode: Default
+    idleTimeoutSeconds: 300
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      # Keep user IO actors and Compute tasks off the control-plane node.
+      num-cpus: "0"
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/component: ray-head
+      spec:
+        terminationGracePeriodSeconds: 60
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.58.0-py312
+            imagePullPolicy: IfNotPresent
+            ports:
+              - name: gcs
+                containerPort: 6379
+              - name: dashboard
+                containerPort: 8265
+              - name: client
+                containerPort: 10001
+              - name: metrics
+                containerPort: 8080
+            resources:
+              requests:
+                cpu: "1"
+                memory: 2Gi
+              limits:
+                cpu: "2"
+                memory: 4Gi
+            volumeMounts:
+              - name: ray-tmp
+                mountPath: /tmp/ray
+        volumes:
+          - name: ray-tmp
+            emptyDir: {}
+
+  workerGroupSpecs:
+    # Container-layer worker type. Add future types as separate worker groups
+    # with a different pyscripts.worker-pool value and suitable image/resources.
+    - groupName: default-workers
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 10
+      labels:
+        pyscripts.worker-pool: default
+      rayStartParams: {}
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/component: ray-worker
+            app.kubernetes.io/part-of: pyscripts
+        spec:
+          terminationGracePeriodSeconds: 60
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.58.0-py312
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 4Gi
+                limits:
+                  cpu: "2"
+                  memory: 4Gi
+              env:
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: PIP_DISABLE_PIP_VERSION_CHECK
+                  value: "1"
+              volumeMounts:
+                - name: ray-tmp
+                  mountPath: /tmp/ray
+                - name: pyscripts-runtime-cache
+                  mountPath: /tmp/pyscripts-runtime
+          volumes:
+            - name: ray-tmp
+              emptyDir: {}
+            - name: pyscripts-runtime-cache
+              emptyDir:
+                sizeLimit: 20Gi

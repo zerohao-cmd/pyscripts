@@ -1,0 +1,68 @@
+minds: "基于Ray调度底座的无状态Python脚本服务托管平台，manager与API Server合并为控制面和调用网关，脚本revision可不停服切换。"
+conponents:
+  api_server:
+    note: "同一进程承载HTTP控制接口、HTTP固定调用入口和动态原生gRPC网关。"
+    current:
+      - "FastAPI使用固定HTTP路由，根据数据库中的活动revision调用统一Actor。"
+      - "gRPC只注册一个固定GenericRpcHandler，通过原生method path查询RouteRegistry。"
+      - "RouteRegistry启动时加载、控制面变更后立即刷新，并周期性从PostgreSQL校准。"
+      - "提供活动gRPC契约查询以及descriptor、Proto源码包和Python SDK下载接口。"
+    target:
+      - "使用Outbox和PostgreSQL LISTEN/NOTIFY缩短多实例路由传播延迟。"
+      - "增加动态Reflection和服务描述接口。"
+      - "补充鉴权、限流、调用截止时间和可观测性。"
+    constraint:
+      - "业务客户端必须保留标准protobuf消息和生成Stub的强类型调用体验。"
+      - "Gateway不得将业务参数转换为JSON或额外的protobuf信封。"
+      - "单个进程持有一个gRPC监听端口，水平扩展以pod为单位。"
+  grpc_gateway:
+    note: "以固定GenericRpcHandler承载可热更新的原生gRPC方法。"
+    current:
+      - "支持unary-unary方法，原始protobuf bytes直接透传给Actor。"
+      - "方法匹配时固定不可变路由对象，保证在途请求继续使用原revision。"
+      - "未知方法由gRPC返回UNIMPLEMENTED，执行错误映射到gRPC状态码。"
+    target:
+      - "按需实现server/client/bidi streaming处理器。"
+      - "动态Reflection从descriptor registry返回当前服务定义。"
+    constraint:
+      - "相同method path不得改变unary/streaming调用基数。"
+      - "破坏性schema更新使用新的protobuf包或服务版本。"
+  execution_actor:
+    note: "按runtime profile部署的统一Ray Actor，支持脚本热加载和IO/Compute互斥调度。"
+    current:
+      - "IO任务可共享Actor，Compute任务独占空闲Actor。"
+      - "revision代码加载到独立Python模块命名空间。"
+      - "每个revision使用独立DescriptorPool解码请求和校验响应。"
+    target:
+      - "路由传播宽限期结束后广播旧revision drain。"
+      - "将Actor生命周期管理从Gateway迁移到独立Pool Controller。"
+    constraint:
+      - "服务默认无状态，运行代码不得依赖跨请求可变全局状态。"
+      - "代码、protobuf类和DescriptorPool必须在inflight归零后一起释放。"
+      - "运行时依赖由容器label和不可变runtime profile决定。"
+  sdk_contracts:
+    note: "将gRPC接口契约作为独立于代码revision的版本化产物，并自动生成Python客户端SDK。"
+    current:
+      - "revision发布时重新编译Proto并校验descriptor与源码一致。"
+      - "按规范化schema digest幂等生成Python消息、类型存根、gRPC Stub和wheel。"
+      - "相同schema的代码revision复用已有契约和SDK，不重复生成包。"
+      - "契约和Python SDK未READY时禁止激活包含gRPC接口的revision。"
+    target:
+      - "增加Protobuf兼容性分析并根据兼容等级校验contract version。"
+      - "将本地契约产物目录替换为对象存储和内部PEP 503包索引。"
+      - "扩展Go、Java和C# SDK生成器。"
+    constraint:
+      - "SDK package version不可覆盖，同一版本只能对应一个schema digest。"
+      - "SDK生成器版本必须记录，构建必须可复现。"
+      - "执行artifact、Proto源码包和SDK是独立发布产物，不向接口用户暴露脚本代码。"
+  database:
+    note: "PostgreSQL保存服务、revision、endpoint、调用记录和outbox事件。"
+    current:
+      - "服务激活通过active_revision_id原子切换。"
+      - "gRPC元数据保存在revision manifest中，不要求新增数据库列。"
+      - "api_contracts、revision_contracts和sdk_artifacts记录契约、revision绑定及SDK产物。"
+    target:
+      - "增加显式route generation和独立route target模型。"
+      - "使用版本化数据库迁移替代create_all。"
+    constraint:
+      - "数据库是路由事实来源，进程内RouteRegistry只是可重建快照。"

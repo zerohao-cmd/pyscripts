@@ -1,8 +1,14 @@
-该项目是一个基于ray为分布式调度底座实现的无状态python脚本任务托管平台
+该项目是一个基于ray为分布式调度底座实现的无状态python脚本服务托管平台
 
 # 项目架构
 ## 用户界面
 用户界面是一个前后端项目, 用户可以在这里注册, 启用, 停用服务, 并且查看服务的运行状态和运行日志
+功能:
+1. 注册服务(git仓库), 设置代码跟踪方式和检查更新时间间隔
+2. manager检测Git变化后先校验pyproject.toml引用的环境版本及依赖兼容性，成功后自动生成revision、artifact和digest
+3. 启动服务(通知api server服务可以被使用)
+4. 停止服务(通知api server服务停止)
+5. 查看使用统计和请求记录
 
 ## manager
 manager是一个常驻服务,  
@@ -14,70 +20,101 @@ manager是一个常驻服务,
 manager是项目的核心组件, 其需要对接脚本层, 服务层以及ray调度层  
 需要把从git仓库拉取到的脚本, 解析为ray可以接受的任务, 以及restful api或者 grpc api.
 
+manager读取git仓库中的pyproject.toml接口定义、逻辑环境标签，以及标准
+`[project].requires-python`和`[project].dependencies`约束。
+服务注册时只配置Git仓库和跟踪策略；运行环境属于Git revision的一部分。
+
+服务运行环境设置主要是
+1. python版本
+2. 项目依赖
+3. 容器标签(决定代码在那类节点中执行)
+
+实际环境内容由版本化runtime label定义；pyproject.toml默认只引用逻辑标签并声明
+脚本需要满足的Python和外部依赖约束。manager解析标签的当前活动版本并验证兼容后
+才允许构建revision；标签版本更新时先重新校验所有跟随者，再热替换运行环境。
+
+接口信息
+1. 有哪些接口入口
+2. 每个接口的定义和返回值定义
+3. 是io还是compute任务
+
+```toml
+[tool.pyscript]
+spec_version = 1
+
+[tool.pyscript.runtime]
+label = "polars-etl"
+
+[[tool.pyscript.endpoints]]
+id = "data_wash"
+task_type = "compute"
+entrypoint = "src.script:wash"
+
+[tool.pyscript.endpoints.start_date]
+type = "Date"
+
+[tool.pyscript.endpoints.end_date]
+type = "Date"
+
+[tool.pyscript.endpoints.drop_duplicate]
+type = "Bool"
+
+[tool.pyscript.endpoints.response_schema]
+type = "String"
+
+```
+
 ## api服务
 api server从manager那里获取到最新的接口数据, 并且启动接口.  接口调用会直接被转到ray执行层, 不经过manager.
-同时api server需要记录接口调用的记录以及接口状态. 
+同时api server需要记录接口调用的记录, 并且把调用记录存入数据库.
+
+### 接口数据类型定义
+详见`./data_design.md`
+
+### gRPC动态接口
+1. 客户端使用业务proto生成的标准强类型Stub, 不直接调用`Invoke(bytes)`信封接口.
+2. api server启动时只注册一个固定的`GenericRpcHandler`, 根据原生gRPC method path查询不可变RouteRegistry快照.
+3. Gateway不解析业务消息, 将原始protobuf bytes透传到已经固定revision的actor.
+4. 每个revision携带`FileDescriptorSet`, actor使用revision独立的DescriptorPool完成请求解码与响应编码, 禁止注册到全局DescriptorPool.
+5. 路由切换后新请求使用新revision; 已匹配的请求继续持有旧路由, 直到inflight归零后释放旧代码和descriptor.
+6. 兼容schema更新可以保持method path; 破坏性更新必须使用新的protobuf包、服务版本或方法名.
+7. 当前落地范围为unary-unary; streaming需要分别实现对应的RpcMethodHandler并保持调用基数不变.
+8. gRPC revision必须携带原始proto目录、descriptor和contract version; 发布阶段校验三者一致.
+9. schema digest变化时自动生成不可变Python wheel; code revision变化但schema不变时复用已有SDK.
+10. 新契约的Python SDK未处于READY状态时禁止激活revision.
 
 ## ray执行层
 k8s提供的ray执行集群
 
+### IO Actor 与 Compute Task
+执行层按任务类型拆分，但共享不可变 runtime profile 和 revision 执行快照。
+
+1. IO 任务发送到按 runtime profile 创建的异步 Actor；同一 Actor 可在 `max_io` 范围内共享事件循环。
+2. Compute 任务包装为无状态 Ray Task，由 Ray 直接按照 CPU/GPU 资源调度，不进入 Actor。
+3. Actor 只接受 IO lease；Compute 请求误入 Actor 时必须明确失败，不能回退到旧的独占 Actor 路径。
+4. Compute 使用固定的通用执行 Task，每次只传 revision、artifact digest、入口、上下文和参数，不捕获业务代码闭包。
+5. Artifact 按 SHA-256 缓存在 Worker 节点；首次下载后复用本地只读文件，不随每次请求重新传输。
+6. Compute 每次执行结束后卸载业务模块，禁止依赖跨请求可变全局状态；已验证和解压的代码文件可以继续缓存。
+7. runtime profile 更新后，新请求使用新 environment digest；已派发 Task 继续持有旧执行快照直至完成。
+8. Invocation 必须记录 execution kind、artifact digest、runtime profile version 和 environment digest；旧环境只有在 Actor lease 与 Compute invocation 都归零后才能释放。
+9. Compute Task 的本地待提交数量必须有上限；请求取消或超时时同时取消 Ray ObjectRef。
+
+### 两层运行标签
+
+1. 容器层使用 `worker_pool`，由 K8s/KubeRay 在 Ray Worker 节点上提供；控制面只发现和引用，不允许用户创建、修改或删除。
+2. Python 层使用可版本化的 runtime label，由用户创建；具体版本通过 Ray `runtime_env` 安装、校验并以 environment digest 标识。
+3. runtime profile 只能引用当前集群已发现的 worker pool；环境校验、IO Actor 和 Compute Task 都必须携带该容器层硬约束。
+4. 相同 environment digest 的 Compute Task 优先使用已预热节点，亲和失败时只能回退到相同 worker pool，不能跨容器类型执行。
+
+### 业务 Artifact 分发
+
+1. 发布阶段必须将业务 ZIP 按 SHA-256 内容寻址上传到 S3 兼容对象存储，数据库只保存稳定的 `s3://bucket/key` 与 digest。
+2. 调度阶段由控制面生成短期预签名下载 URL；对象存储凭据不得传递给 Ray Worker。
+3. Worker 仅在节点本地缓存未命中时下载，并必须在解压前重新校验 SHA-256。
+4. 预签名 URL 不得持久化；Artifact 只有在没有 revision 引用且超过保留期后才能由垃圾回收任务删除。
+
+
 ## 数据库
-使用postgresql作为后端数据库, 储存api调用记录, 以及部分持久化信息.
-
-## script_hook库
-这个python库用于方便用户在代码里面使用装饰器hook函数作为api, 类似:
-```python
-from script_hook import hook_api, call
-import asyncio
-import time
-
-# 显式设置服务id, id不能和已有的id重复
-@hook_api(api_type='grpc', api_id='test_add') 
-def add(x: int, y: int) -> int:
-    return x + y
-
-# 不显式设置name, 自动使用函数名作为服务id
-@hook_api(api_type=['rest', 'grpc']) 
-def sub(x: int, y: int) -> int:
-    return x - y
-
-# async函数自动被转换为IO任务
-@hook_api(api_type=['rest', 'grpc'])
-async def async_task() -> int: 
-    await asyncio.sleep(10)
-    return 1
-
-# 显式作为IO任务, 非async函数显式设置为IO服务, 会被包装为线程池异步
-@hook_api(api_type=['rest', 'grpc'], task_type='io')
-def async_task() -> int: 
-    time.sleep(10)
-    return 1
-
-# 在服务中快捷调用另外一个服务api
-@hook_api(api_type=['rest', 'grpc'])
-def add_all(x: list[int]) -> int: 
-    return reduce(call('test_add'),x)
-```
-
-
-# 解析逻辑
-解析分为两层, 一个是运行环境层, 一个是具体服务层
-
-## 运行环境层
-从pyproject.toml中获取运行环境信息, 或者通过PEP 723中的内容获取运行环境信息
-包括
-1. ray的运行node标签
-2. python版本
-3. 依赖信息
-4. 脚本扫描文件(如果是PEP 723那样的脚本, 则默认是本文件)
-
-## 具体服务层
-根据hook_api中提供的数据获取单个服务的配置
-1. 接口id(api_id)
-2. 服务类型(api_type)
-3. 运行类型(task_type)
-4. cpu占用(task_cpu)
-5. 内存占用(task_memory)
-
-## 概念详解
-
+使用postgresql作为后端数据库.
+主要储存服务元信息, 例如服务注册信息, 当前服务checkpoint, apiserver会监控这部分数据调整api
+还有每个服务的调用记录, 例如调用参数, 中间的日志捕获(脚本中的print), 调用返回结果
