@@ -12,6 +12,7 @@ import type {
   ServiceDetail,
   UpdateServiceInput,
   WorkerPool,
+  WebhookConfig,
 } from "./types";
 
 export class ApiError extends Error {
@@ -82,6 +83,16 @@ export const api = {
     request<ServiceDetail>(`/admin/services/${serviceId}`, {
       method: "PATCH",
       body: JSON.stringify(body),
+    }),
+  serviceWebhook: (serviceId: string) =>
+    request<WebhookConfig>(`/admin/services/${serviceId}/webhook`),
+  rotateServiceWebhook: (serviceId: string) =>
+    request<WebhookConfig>(`/admin/services/${serviceId}/webhook/rotate`, {
+      method: "POST",
+    }),
+  disableServiceWebhook: (serviceId: string) =>
+    request<WebhookConfig>(`/admin/services/${serviceId}/webhook`, {
+      method: "DELETE",
     }),
   revisions: (serviceId: string) =>
     request<Revision[]>(`/admin/services/${serviceId}/revisions`),

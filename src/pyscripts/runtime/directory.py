@@ -17,6 +17,7 @@ from pyscripts.repository import ResolvedEndpoint
 from pyscripts.runtime.actor import UnifiedActor
 from pyscripts.runtime.compute import ComputeTask, ComputeTaskResult
 from pyscripts.runtime.output import ExecutionOutcome
+from pyscripts.runtime.profiles import materialize_runtime_env
 from pyscripts.storage import ArtifactStore, create_artifact_store
 
 
@@ -295,11 +296,14 @@ class ProfilePoolScheduler:
 
     def _register_profile(self, target: ResolvedEndpoint) -> PoolProfile:
         key = target.environment_digest or target.runtime_profile
+        runtime_env = materialize_runtime_env(
+            dict(target.runtime_env or {}), target.pip_source, self.settings
+        )
         profile = PoolProfile(
             key=key,
             profile_ref=target.runtime_profile,
             worker_pool=target.worker_pool or target.runtime_profile,
-            runtime_env=dict(target.runtime_env or {}),
+            runtime_env=runtime_env,
         )
         existing = self._profiles.setdefault(key, profile)
         if existing != profile:

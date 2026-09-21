@@ -22,6 +22,16 @@ class ArtifactStoreError(RuntimeError):
 class ArtifactStore(Protocol):
     def publish(self, source_uri: str, expected_digest: str) -> str: ...
 
+    def publish_blob(
+        self,
+        source_uri: str,
+        expected_digest: str,
+        *,
+        category: str,
+        suffix: str,
+        content_type: str,
+    ) -> str: ...
+
     def distribution_uri(self, stored_uri: str) -> str: ...
 
 
@@ -32,13 +42,36 @@ class PassthroughArtifactStore:
         self.root = root or Path("/tmp/pyscripts-artifacts")
 
     def publish(self, source_uri: str, expected_digest: str) -> str:
+        return self.publish_blob(
+            source_uri,
+            expected_digest,
+            category="artifacts",
+            suffix=".zip",
+            content_type="application/zip",
+        )
+
+    def publish_blob(
+        self,
+        source_uri: str,
+        expected_digest: str,
+        *,
+        category: str,
+        suffix: str,
+        content_type: str,
+    ) -> str:
+        del content_type
         digest = _normalize_digest(expected_digest)
-        destination = self.root / "sha256" / digest[:2] / f"{digest}.zip"
+        safe_category = _normalize_category(category)
+        safe_suffix = _normalize_suffix(suffix)
+        category_root = (
+            self.root if safe_category == "artifacts" else self.root / safe_category
+        )
+        destination = category_root / "sha256" / digest[:2] / f"{digest}{safe_suffix}"
         if destination.is_file() and _file_digest(destination) == digest:
             return destination.as_uri()
         destination.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
-            suffix=".zip",
+            suffix=safe_suffix,
             dir=destination.parent,
             delete=False,
         ) as temporary:
@@ -100,8 +133,25 @@ class S3ArtifactStore:
         self.client = client
 
     def publish(self, source_uri: str, expected_digest: str) -> str:
+        return self.publish_blob(
+            source_uri,
+            expected_digest,
+            category="artifacts",
+            suffix=".zip",
+            content_type="application/zip",
+        )
+
+    def publish_blob(
+        self,
+        source_uri: str,
+        expected_digest: str,
+        *,
+        category: str,
+        suffix: str,
+        content_type: str,
+    ) -> str:
         digest = _normalize_digest(expected_digest)
-        key = self._artifact_key(digest)
+        key = self._blob_key(category, digest, suffix)
         existing = self._head(key)
         if (
             existing is not None
@@ -109,7 +159,9 @@ class S3ArtifactStore:
         ):
             return self._stored_uri(key)
 
-        with tempfile.NamedTemporaryFile(suffix=".zip") as temporary:
+        with tempfile.NamedTemporaryFile(
+            suffix=_normalize_suffix(suffix)
+        ) as temporary:
             self._download_source(source_uri, Path(temporary.name))
             actual = _file_digest(Path(temporary.name))
             if actual != digest:
@@ -123,7 +175,7 @@ class S3ArtifactStore:
                     self.bucket,
                     key,
                     ExtraArgs={
-                        "ContentType": "application/zip",
+                        "ContentType": content_type,
                         "Metadata": {"sha256": digest},
                     },
                 )
@@ -171,9 +223,12 @@ class S3ArtifactStore:
                 f"failed to inspect s3://{self.bucket}/{key}: {error}"
             ) from error
 
-    def _artifact_key(self, digest: str) -> str:
-        suffix = f"sha256/{digest[:2]}/{digest}.zip"
-        return f"{self.prefix}/{suffix}" if self.prefix else suffix
+    def _blob_key(self, category: str, digest: str, suffix: str) -> str:
+        safe_category = _normalize_category(category)
+        safe_suffix = _normalize_suffix(suffix)
+        category_prefix = "" if safe_category == "artifacts" else f"{safe_category}/"
+        path = f"{category_prefix}sha256/{digest[:2]}/{digest}{safe_suffix}"
+        return f"{self.prefix}/{path}" if self.prefix else path
 
     def _stored_uri(self, key: str) -> str:
         return f"s3://{self.bucket}/{urllib.parse.quote(key, safe='/')}"
@@ -220,6 +275,28 @@ def _normalize_digest(value: str) -> str:
     ):
         raise ArtifactStoreError("artifact digest must be a SHA-256 hex digest")
     return digest
+
+
+def _normalize_category(value: str) -> str:
+    parts = value.strip("/").split("/")
+    if not parts or any(
+        not part or part in {".", ".."} or not part.replace("-", "").isalnum()
+        for part in parts
+    ):
+        raise ArtifactStoreError("blob category must contain safe path segments")
+    return "/".join(parts)
+
+
+def _normalize_suffix(value: str) -> str:
+    if (
+        not value.startswith(".")
+        or "/" in value
+        or "\\" in value
+        or len(value) > 16
+        or not value[1:].replace(".", "").isalnum()
+    ):
+        raise ArtifactStoreError("blob suffix is invalid")
+    return value
 
 
 def _file_digest(path: Path) -> str:

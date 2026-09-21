@@ -29,6 +29,7 @@ export interface Service {
   check_interval_seconds: number | null;
   status: ServiceStatus;
   active_revision_id: string | null;
+  webhook_enabled: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -100,15 +101,6 @@ export interface InvocationLog {
   created_at: string;
 }
 
-export interface SdkArtifact {
-  language: string;
-  generator_version: string;
-  package_name: string;
-  package_version: string;
-  artifact_digest: string;
-  download_url: string | null;
-}
-
 export interface Contract {
   id: string;
   service: string;
@@ -116,10 +108,9 @@ export interface Contract {
   contract_version: string;
   schema_digest: string;
   source_digest: string;
+  proto_bundle_digest: string;
   methods: string[];
-  descriptor_url: string | null;
-  proto_bundle_url: string | null;
-  python_sdk: SdkArtifact;
+  proto_bundle_url: string;
 }
 
 export interface RuntimeProfileVersion {
@@ -130,6 +121,7 @@ export interface RuntimeProfileVersion {
   profile_ref: string;
   python_version: string;
   worker_pool: string;
+  pip_source: "default" | "private";
   requested_dependencies: string[];
   resolved_dependencies: Record<string, string>;
   import_checks: string[];
@@ -156,6 +148,13 @@ export interface RuntimeProfileInput {
   worker_pool: string;
   dependencies: string[];
   import_checks: string[];
+  pip_source: "default" | "private";
+}
+
+export interface WebhookConfig {
+  enabled: boolean;
+  url: string | null;
+  configured_at: string | null;
 }
 
 export interface WorkerPool {

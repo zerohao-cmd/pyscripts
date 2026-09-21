@@ -1,21 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import logging
+import secrets
+import urllib.parse
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from datetime import UTC
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pyscripts.config import Settings, get_settings
-from pyscripts.contracts import PythonSdkPublisher
+from pyscripts.contracts import ProtoContractPublisher
 from pyscripts.contracts.builder import ContractBuildError
 from pyscripts.db import (
     create_engine,
@@ -56,6 +63,8 @@ from pyscripts.schemas import (
     CreateRuntimeLabelRequest,
     CreateRuntimeProfileVersionRequest,
     CreateServiceRequest,
+    EndpointSpec,
+    GrpcContractSpec,
     InvocationListItemResponse,
     InvocationLogResponse,
     InvocationResponse,
@@ -65,11 +74,11 @@ from pyscripts.schemas import (
     ResolvedRevisionRequest,
     RuntimeLabelResponse,
     RuntimeProfileVersionResponse,
-    SdkArtifactResponse,
     ServiceDetailResponse,
     ServiceResponse,
     UpdateServiceRequest,
     WorkerPoolResponse,
+    WebhookConfigResponse,
 )
 from pyscripts.runtime.worker_pools import (
     UnknownWorkerPoolError,
@@ -90,6 +99,7 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
 
 
 SessionDependency = Annotated[AsyncSession, Depends(get_session)]
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -122,9 +132,9 @@ def create_app(
             worker_pool_catalog or create_worker_pool_catalog(app_settings)
         )
         app.state.background_tasks = set()
-        app.state.sdk_publisher = PythonSdkPublisher(
-            app_settings.contract_artifact_root,
-            app_settings.sdk_distribution_prefix,
+        app.state.service_sync_locks = {}
+        app.state.contract_publisher = ProtoContractPublisher(
+            app_settings.contract_artifact_root
         )
         app.state.grpc_routes = GrpcRouteRegistry()
         await app.state.grpc_routes.refresh(app.state.session_factory)
@@ -192,6 +202,7 @@ def create_app(
             profile_ref=version.profile_ref,
             python_version=version.python_version,
             worker_pool=version.worker_pool,
+            pip_source=version.pip_source,
             requested_dependencies=version.requested_dependencies,
             resolved_dependencies=version.resolved_dependencies,
             import_checks=version.import_checks,
@@ -217,6 +228,7 @@ def create_app(
                 worker_pool=version.worker_pool,
                 dependencies=version.requested_dependencies,
                 import_checks=version.import_checks,
+                pip_source=version.pip_source,
             )
         except RuntimeProfileValidationError as error:
             async with session.begin():
@@ -515,6 +527,65 @@ def create_app(
         return await get_service_detail(service_id, session)
 
     @app.get(
+        "/admin/services/{service_id}/webhook",
+        response_model=WebhookConfigResponse,
+    )
+    async def get_service_webhook(
+        service_id: uuid.UUID,
+        session: SessionDependency,
+    ) -> WebhookConfigResponse:
+        try:
+            service = await PlatformRepository(session).get_service(service_id)
+        except NotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return WebhookConfigResponse(
+            enabled=service.webhook_enabled,
+            configured_at=service.webhook_configured_at,
+        )
+
+    @app.post(
+        "/admin/services/{service_id}/webhook/rotate",
+        response_model=WebhookConfigResponse,
+    )
+    async def rotate_service_webhook(
+        request: Request,
+        service_id: uuid.UUID,
+        session: SessionDependency,
+    ) -> WebhookConfigResponse:
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        try:
+            async with session.begin():
+                service = await PlatformRepository(
+                    session
+                ).configure_service_webhook(service_id, token_hash)
+        except NotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        base_url = (app_settings.public_base_url or str(request.base_url)).rstrip("/")
+        return WebhookConfigResponse(
+            enabled=True,
+            url=f"{base_url}/hooks/services/{service.id}/{token}",
+            configured_at=service.webhook_configured_at,
+        )
+
+    @app.delete(
+        "/admin/services/{service_id}/webhook",
+        response_model=WebhookConfigResponse,
+    )
+    async def disable_service_webhook(
+        service_id: uuid.UUID,
+        session: SessionDependency,
+    ) -> WebhookConfigResponse:
+        try:
+            async with session.begin():
+                await PlatformRepository(session).configure_service_webhook(
+                    service_id, None
+                )
+        except NotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return WebhookConfigResponse(enabled=False)
+
+    @app.get(
         "/admin/services/{service_id}/revisions",
         response_model=list[RevisionDetailResponse],
     )
@@ -663,14 +734,16 @@ def create_app(
         previous_descriptor = None
         previous_version = None
         if previous_contract is not None:
-            previous_path = app.state.sdk_publisher.resolve_local_uri(
+            previous_uri = app.state.artifact_store.distribution_uri(
                 previous_contract.descriptor_uri
             )
-            previous_descriptor = await asyncio.to_thread(previous_path.read_bytes)
+            previous_descriptor = await asyncio.to_thread(
+                app.state.contract_publisher.read_bytes, previous_uri
+            )
             previous_version = previous_contract.contract_version
 
         prepared = await asyncio.to_thread(
-            app.state.sdk_publisher.prepare_generated_artifact,
+            app.state.contract_publisher.prepare_generated_artifact,
             service_name,
             source_body,
             previous_descriptor=previous_descriptor,
@@ -686,10 +759,32 @@ def create_app(
                 }
             )
         published = await asyncio.to_thread(
-            app.state.sdk_publisher.publish,
+            app.state.contract_publisher.publish,
             service_name,
             source_body,
         )
+        if published is not None:
+            descriptor_uri = await asyncio.to_thread(
+                app.state.artifact_store.publish_blob,
+                published.descriptor_uri,
+                published.schema_digest,
+                category="contracts/descriptors",
+                suffix=".pb",
+                content_type="application/octet-stream",
+            )
+            proto_bundle_uri = await asyncio.to_thread(
+                app.state.artifact_store.publish_blob,
+                published.proto_bundle_uri,
+                published.proto_bundle_digest,
+                category="contracts/proto",
+                suffix=".zip",
+                content_type="application/zip",
+            )
+            published = replace(
+                published,
+                descriptor_uri=descriptor_uri,
+                proto_bundle_uri=proto_bundle_uri,
+            )
         stored_uri = await asyncio.to_thread(
             app.state.artifact_store.publish,
             source_body.artifact_uri,
@@ -700,9 +795,7 @@ def create_app(
             repository = PlatformRepository(session)
             contract_id = None
             if published is not None:
-                contract, _ = await repository.register_contract(
-                    service_id, published
-                )
+                contract = await repository.register_contract(service_id, published)
                 contract_id = contract.id
             revision = await repository.create_revision(
                 service_id,
@@ -719,14 +812,9 @@ def create_app(
         await app.state.grpc_routes.refresh(app.state.session_factory)
         return revision
 
-    @app.post(
-        "/admin/services/{service_id}/revisions",
-        response_model=RevisionResponse,
-        status_code=status.HTTP_201_CREATED,
-    )
-    async def sync_git_revision(
+    async def sync_git_revision_unlocked(
         service_id: uuid.UUID,
-        session: SessionDependency,
+        session: AsyncSession,
     ) -> RevisionResponse:
         artifact = None
         try:
@@ -793,6 +881,101 @@ def create_app(
             if artifact is not None:
                 artifact.cleanup()
         return RevisionResponse.model_validate(revision)
+
+    async def synchronize_git_revision(
+        service_id: uuid.UUID,
+        session: AsyncSession,
+    ) -> RevisionResponse:
+        lock = app.state.service_sync_locks.setdefault(service_id, asyncio.Lock())
+        async with lock:
+            return await sync_git_revision_unlocked(service_id, session)
+
+    @app.post(
+        "/admin/services/{service_id}/revisions",
+        response_model=RevisionResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def sync_git_revision(
+        service_id: uuid.UUID,
+        session: SessionDependency,
+    ) -> RevisionResponse:
+        return await synchronize_git_revision(service_id, session)
+
+    async def run_webhook_sync(service_id: uuid.UUID) -> None:
+        async with app.state.session_factory() as sync_session:
+            try:
+                await synchronize_git_revision(service_id, sync_session)
+            except Exception:
+                logger.exception(
+                    "webhook-triggered service synchronization failed",
+                    extra={"service_id": str(service_id)},
+                )
+
+    @app.post(
+        "/hooks/services/{service_id}/{token}",
+        status_code=status.HTTP_202_ACCEPTED,
+        include_in_schema=False,
+    )
+    async def receive_git_webhook(
+        request: Request,
+        service_id: uuid.UUID,
+        token: str,
+        session: SessionDependency,
+    ) -> dict[str, str]:
+        try:
+            service = await PlatformRepository(session).get_service(service_id)
+        except NotFoundError as error:
+            raise HTTPException(status_code=404, detail="webhook does not exist") from error
+        supplied_hash = hashlib.sha256(token.encode()).hexdigest()
+        if (
+            service.tracking_mode != "webhook"
+            or service.webhook_token_hash is None
+            or not hmac.compare_digest(service.webhook_token_hash, supplied_hash)
+        ):
+            raise HTTPException(status_code=404, detail="webhook does not exist")
+
+        declared_size = request.headers.get("content-length")
+        if declared_size:
+            try:
+                content_length = int(declared_size)
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=400, detail="invalid Content-Length header"
+                ) from error
+            if content_length < 0:
+                raise HTTPException(
+                    status_code=400, detail="invalid Content-Length header"
+                )
+            if content_length > app_settings.webhook_max_body_bytes:
+                raise HTTPException(
+                    status_code=413, detail="webhook payload is too large"
+                )
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > app_settings.webhook_max_body_bytes:
+                raise HTTPException(status_code=413, detail="webhook payload is too large")
+
+        gitea_event = request.headers.get("x-gitea-event")
+        gitlab_event = request.headers.get("x-gitlab-event")
+        if gitea_event is not None:
+            provider = "gitea"
+            is_push = gitea_event.lower() == "push"
+        elif gitlab_event is not None:
+            provider = "gitlab"
+            is_push = gitlab_event.lower() == "push hook"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="expected X-Gitea-Event or X-Gitlab-Event header",
+            )
+        if not is_push:
+            return {"status": "ignored", "provider": provider}
+
+        task = asyncio.create_task(run_webhook_sync(service_id))
+        app.state.background_tasks.add(task)
+        task.add_done_callback(app.state.background_tasks.discard)
+        return {"status": "accepted", "provider": provider}
 
     @app.post(
         "/admin/services/{service_id}/revisions/import",
@@ -901,13 +1084,168 @@ def create_app(
         await app.state.grpc_routes.refresh(app.state.session_factory)
         return ServiceResponse.model_validate(service)
 
+    async def ensure_contract_artifacts(
+        bundle: Any,
+        session: AsyncSession,
+    ) -> None:
+        contract = bundle.contract
+        descriptor_scheme = urllib.parse.urlparse(contract.descriptor_uri).scheme
+        proto_scheme = urllib.parse.urlparse(contract.proto_bundle_uri).scheme
+        if (
+            descriptor_scheme == "s3"
+            and proto_scheme == "s3"
+            and contract.proto_bundle_digest
+        ):
+            return
+        if (
+            contract.proto_bundle_digest
+            and descriptor_scheme in {"", "file"}
+            and proto_scheme in {"", "file"}
+        ):
+            descriptor_path = Path(
+                urllib.parse.unquote(
+                    urllib.parse.urlparse(contract.descriptor_uri).path
+                    or contract.descriptor_uri
+                )
+            )
+            proto_path = Path(
+                urllib.parse.unquote(
+                    urllib.parse.urlparse(contract.proto_bundle_uri).path
+                    or contract.proto_bundle_uri
+                )
+            )
+            if descriptor_path.is_file() and proto_path.is_file():
+                return
+
+        published = None
+        try:
+            descriptor_path = app.state.contract_publisher.resolve_local_uri(
+                contract.descriptor_uri
+            )
+            proto_path = app.state.contract_publisher.resolve_local_uri(
+                contract.proto_bundle_uri
+            )
+            descriptor_uri = descriptor_path.as_uri()
+            proto_bundle_uri = proto_path.as_uri()
+            proto_bundle_digest = "sha256:" + hashlib.sha256(
+                proto_path.read_bytes()
+            ).hexdigest()
+        except ContractBuildError:
+            revision = bundle.revision
+            if revision is None:
+                raise ContractBuildError(
+                    "contract artifacts are unavailable and no source revision exists"
+                )
+            source_uri = app.state.artifact_store.distribution_uri(
+                revision.artifact_uri
+            )
+            interface = await asyncio.to_thread(
+                parse_artifact_interface,
+                source_uri,
+                revision.artifact_digest,
+            )
+            endpoints = [
+                EndpointSpec.from_manifest(dict(item))
+                for item in revision.manifest["endpoints"]
+            ]
+            contract_metadata = revision.manifest.get("grpc_contract")
+            if contract_metadata is not None:
+                grpc_contract = GrpcContractSpec.model_validate(contract_metadata)
+            elif interface.grpc_contract is not None:
+                grpc_contract = interface.grpc_contract
+            else:
+                grpc_endpoints = [
+                    endpoint for endpoint in endpoints if endpoint.grpc is not None
+                ]
+                if not grpc_endpoints or not all(
+                    endpoint.grpc.generated for endpoint in grpc_endpoints
+                ):
+                    raise ContractBuildError(
+                        "contract metadata is unavailable for artifact recovery"
+                    )
+                descriptor_paths = {
+                    endpoint.grpc.descriptor_path for endpoint in grpc_endpoints
+                }
+                if len(descriptor_paths) != 1:
+                    raise ContractBuildError(
+                        "generated endpoints do not share one descriptor"
+                    )
+                descriptor_path = PurePosixPath(descriptor_paths.pop())
+                grpc_contract = GrpcContractSpec(
+                    version=contract.contract_version,
+                    proto_root=str(descriptor_path.parent / "proto"),
+                )
+            grpc_contract = grpc_contract.model_copy(
+                update={"version": contract.contract_version}
+            )
+            request = ResolvedRevisionRequest(
+                revision=revision.revision,
+                artifact_uri=source_uri,
+                artifact_digest=revision.artifact_digest,
+                endpoints=endpoints,
+                grpc_contract=grpc_contract,
+                runtime_profile=revision.runtime_profile,
+                requires_python=interface.requires_python,
+                dependencies=interface.dependencies,
+            )
+            published = await asyncio.to_thread(
+                app.state.contract_publisher.publish,
+                bundle.service.name,
+                request,
+            )
+            if published is None:
+                raise ContractBuildError("source revision did not produce a contract")
+            expected = (
+                contract.schema_digest,
+                contract.source_digest,
+                contract.contract_version,
+                sorted(contract.methods),
+            )
+            actual = (
+                published.schema_digest,
+                published.source_digest,
+                published.contract_version,
+                sorted(published.methods),
+            )
+            if actual != expected:
+                raise ContractBuildError(
+                    "regenerated contract does not match persisted metadata"
+                )
+            descriptor_uri = published.descriptor_uri
+            proto_bundle_uri = published.proto_bundle_uri
+            proto_bundle_digest = published.proto_bundle_digest
+
+        stored_descriptor_uri = await asyncio.to_thread(
+            app.state.artifact_store.publish_blob,
+            descriptor_uri,
+            contract.schema_digest,
+            category="contracts/descriptors",
+            suffix=".pb",
+            content_type="application/octet-stream",
+        )
+        stored_proto_uri = await asyncio.to_thread(
+            app.state.artifact_store.publish_blob,
+            proto_bundle_uri,
+            proto_bundle_digest,
+            category="contracts/proto",
+            suffix=".zip",
+            content_type="application/zip",
+        )
+        contract.descriptor_uri = stored_descriptor_uri
+        contract.proto_bundle_uri = stored_proto_uri
+        contract.proto_bundle_digest = proto_bundle_digest
+        await session.commit()
+        logger.info(
+            "persisted contract artifacts in object storage",
+            extra={"contract_id": str(contract.id), "regenerated": published is not None},
+        )
+
     def contract_response(
         request: Request,
         bundle: Any,
     ) -> ContractResponse:
         contract = bundle.contract
-        sdk = bundle.sdk
-        sdk_path = app.state.sdk_publisher.resolve_local_uri(sdk.artifact_uri)
+        assert contract.proto_bundle_digest is not None
         return ContractResponse(
             id=contract.id,
             service=bundle.service.name,
@@ -915,26 +1253,10 @@ def create_app(
             contract_version=contract.contract_version,
             schema_digest=contract.schema_digest,
             source_digest=contract.source_digest,
+            proto_bundle_digest=contract.proto_bundle_digest,
             methods=contract.methods,
-            descriptor_url=str(
-                request.url_for("download_contract_descriptor", contract_id=contract.id)
-            ),
             proto_bundle_url=str(
                 request.url_for("download_contract_proto", contract_id=contract.id)
-            ),
-            python_sdk=SdkArtifactResponse(
-                language=sdk.language,
-                generator_version=sdk.generator_version,
-                package_name=sdk.package_name,
-                package_version=sdk.package_version,
-                artifact_digest=sdk.artifact_digest,
-                download_url=str(
-                    request.url_for(
-                        "download_python_sdk_file",
-                        contract_id=contract.id,
-                        filename=sdk_path.name,
-                    )
-                ),
             ),
         )
 
@@ -949,30 +1271,32 @@ def create_app(
     ) -> ContractResponse:
         try:
             bundle = await PlatformRepository(session).get_active_contract(service_name)
-        except NotFoundError as error:
+            await ensure_contract_artifacts(bundle, session)
+        except (
+            NotFoundError,
+            ContractBuildError,
+            InterfaceMetadataError,
+            ArtifactStoreError,
+        ) as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
         return contract_response(request, bundle)
 
-    @app.get(
-        "/v1/contracts/{contract_id}/descriptor.pb",
-        name="download_contract_descriptor",
-    )
-    async def download_contract_descriptor(
-        contract_id: uuid.UUID,
-        session: SessionDependency,
-    ) -> FileResponse:
-        try:
-            bundle = await PlatformRepository(session).get_contract(contract_id)
-            path = app.state.sdk_publisher.resolve_local_uri(
-                bundle.contract.descriptor_uri
-            )
-        except (NotFoundError, ContractBuildError) as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        return FileResponse(
-            path,
-            media_type="application/octet-stream",
-            filename="descriptor.pb",
-        )
+    def contract_download_response(
+        stored_uri: str,
+        *,
+        media_type: str,
+        filename: str,
+    ) -> Any:
+        uri = app.state.artifact_store.distribution_uri(stored_uri)
+        parsed = urllib.parse.urlparse(uri)
+        if parsed.scheme in {"http", "https"}:
+            return RedirectResponse(uri, status_code=307)
+        if parsed.scheme in {"", "file"}:
+            path = Path(urllib.parse.unquote(parsed.path or uri)).resolve()
+            if not path.is_file():
+                raise HTTPException(status_code=404, detail="contract file is missing")
+            return FileResponse(path, media_type=media_type, filename=filename)
+        raise HTTPException(status_code=502, detail="contract storage URI is invalid")
 
     @app.get(
         "/v1/contracts/{contract_id}/proto.zip",
@@ -981,57 +1305,21 @@ def create_app(
     async def download_contract_proto(
         contract_id: uuid.UUID,
         session: SessionDependency,
-    ) -> FileResponse:
+    ) -> Any:
         try:
             bundle = await PlatformRepository(session).get_contract(contract_id)
-            path = app.state.sdk_publisher.resolve_local_uri(
-                bundle.contract.proto_bundle_uri
-            )
-        except (NotFoundError, ContractBuildError) as error:
+            await ensure_contract_artifacts(bundle, session)
+        except (
+            NotFoundError,
+            ContractBuildError,
+            InterfaceMetadataError,
+            ArtifactStoreError,
+        ) as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
-        return FileResponse(path, media_type="application/zip", filename="proto.zip")
-
-    @app.api_route(
-        "/v1/contracts/{contract_id}/python-sdk/{filename}",
-        methods=["GET", "HEAD"],
-        name="download_python_sdk_file",
-    )
-    async def download_python_sdk_file(
-        contract_id: uuid.UUID,
-        filename: str,
-        session: SessionDependency,
-    ) -> FileResponse:
-        try:
-            bundle = await PlatformRepository(session).get_contract(contract_id)
-            path = app.state.sdk_publisher.resolve_local_uri(bundle.sdk.artifact_uri)
-        except (NotFoundError, ContractBuildError) as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        if filename != path.name:
-            raise HTTPException(status_code=404, detail="Python SDK file does not exist")
-        return FileResponse(
-            path,
+        return contract_download_response(
+            bundle.contract.proto_bundle_uri,
             media_type="application/zip",
-            filename=path.name,
-        )
-
-    @app.get(
-        "/v1/contracts/{contract_id}/python-sdk",
-        name="download_python_sdk_legacy",
-        include_in_schema=False,
-    )
-    async def download_python_sdk_legacy(
-        contract_id: uuid.UUID,
-        session: SessionDependency,
-    ) -> FileResponse:
-        try:
-            bundle = await PlatformRepository(session).get_contract(contract_id)
-            path = app.state.sdk_publisher.resolve_local_uri(bundle.sdk.artifact_uri)
-        except (NotFoundError, ContractBuildError) as error:
-            raise HTTPException(status_code=404, detail=str(error)) from error
-        return FileResponse(
-            path,
-            media_type="application/zip",
-            filename=path.name,
+            filename="proto.zip",
         )
 
     @app.post(

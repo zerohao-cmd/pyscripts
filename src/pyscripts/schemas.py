@@ -154,6 +154,33 @@ class EndpointSpec(BaseModel):
             "properties": self.parameters,
         }
 
+    @classmethod
+    def from_manifest(cls, value: dict[str, Any]) -> EndpointSpec:
+        metadata_fields = {
+            "id",
+            "task_type",
+            "entrypoint",
+            "io_type",
+            "response_schema",
+            "grpc",
+            "num_cpus",
+            "num_gpus",
+        }
+        return cls.model_validate(
+            {
+                **{
+                    name: item
+                    for name, item in value.items()
+                    if name in metadata_fields
+                },
+                "parameters": {
+                    name: item
+                    for name, item in value.items()
+                    if name not in metadata_fields
+                },
+            }
+        )
+
     def to_manifest(self) -> dict[str, Any]:
         """Serialize endpoint metadata with function parameters kept flat."""
 
@@ -169,6 +196,8 @@ class EndpointSpec(BaseModel):
 class GrpcContractSpec(BaseModel):
     version: str
     proto_root: str = "proto"
+    # Accepted only so historical manifests remain readable. Proto publication
+    # no longer builds or names a Python distribution.
     package_name: str | None = None
 
     model_config = {"extra": "forbid"}
@@ -330,6 +359,7 @@ class RuntimeProfileSpecRequest(BaseModel):
     )
     dependencies: list[str] = Field(default_factory=list, max_length=256)
     import_checks: list[str] = Field(default_factory=list, max_length=128)
+    pip_source: Literal["default", "private"] = "default"
 
     @field_validator("dependencies")
     @classmethod
@@ -388,6 +418,7 @@ class RuntimeProfileVersionResponse(BaseModel):
     profile_ref: str
     python_version: str
     worker_pool: str
+    pip_source: str
     requested_dependencies: list[str]
     resolved_dependencies: dict[str, str]
     import_checks: list[str]
@@ -425,6 +456,7 @@ class ServiceResponse(BaseModel):
     check_interval_seconds: int | None
     status: str
     active_revision_id: uuid.UUID | None
+    webhook_enabled: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -458,6 +490,12 @@ class ServiceDetailResponse(ServiceResponse):
     revision_count: int
     active_revision: RevisionDetailResponse | None
     endpoints: list[dict[str, Any]]
+
+
+class WebhookConfigResponse(BaseModel):
+    enabled: bool
+    url: str | None = None
+    configured_at: datetime | None = None
 
 
 class InvocationListItemResponse(BaseModel):
@@ -495,15 +533,6 @@ class InvocationResponse(BaseModel):
     result: Any
 
 
-class SdkArtifactResponse(BaseModel):
-    language: str
-    generator_version: str
-    package_name: str
-    package_version: str
-    artifact_digest: str
-    download_url: str | None = None
-
-
 class ContractResponse(BaseModel):
     id: uuid.UUID
     service: str
@@ -511,7 +540,6 @@ class ContractResponse(BaseModel):
     contract_version: str
     schema_digest: str
     source_digest: str
+    proto_bundle_digest: str
     methods: list[str]
-    descriptor_url: str | None = None
-    proto_bundle_url: str | None = None
-    python_sdk: SdkArtifactResponse
+    proto_bundle_url: str

@@ -46,6 +46,37 @@ def _create_and_upgrade_schema(connection: Connection) -> None:
         connection.exec_driver_sql(
             "ALTER TABLE services ADD COLUMN runtime_tracking_mode VARCHAR(32)"
         )
+    if "webhook_token_hash" not in service_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE services ADD COLUMN webhook_token_hash VARCHAR(64)"
+        )
+    if "webhook_configured_at" not in service_columns:
+        timestamp_type = (
+            "TIMESTAMP WITH TIME ZONE"
+            if connection.dialect.name == "postgresql"
+            else "DATETIME"
+        )
+        connection.exec_driver_sql(
+            "ALTER TABLE services ADD COLUMN webhook_configured_at "
+            f"{timestamp_type}"
+        )
+    profile_columns = {
+        column["name"]
+        for column in inspect(connection).get_columns("runtime_profile_versions")
+    }
+    if "pip_source" not in profile_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE runtime_profile_versions "
+            "ADD COLUMN pip_source VARCHAR(24) NOT NULL DEFAULT 'default'"
+        )
+    contract_columns = {
+        column["name"] for column in inspect(connection).get_columns("api_contracts")
+    }
+    if "proto_bundle_digest" not in contract_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE api_contracts "
+            "ADD COLUMN proto_bundle_digest VARCHAR(128)"
+        )
     execution_columns = {
         column["name"]
         for column in inspect(connection).get_columns("invocation_executions")

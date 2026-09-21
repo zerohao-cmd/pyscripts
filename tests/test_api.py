@@ -21,6 +21,20 @@ class FakeArtifactStore:
         self.published.append((source_uri, expected_digest))
         return f"s3://pyscripts/sha256/{expected_digest}.zip"
 
+    def publish_blob(
+        self,
+        source_uri: str,
+        expected_digest: str,
+        *,
+        category: str,
+        suffix: str,
+        content_type: str,
+    ) -> str:
+        del content_type
+        self.published.append((source_uri, expected_digest))
+        digest = expected_digest.removeprefix("sha256:")
+        return f"s3://pyscripts/{category}/sha256/{digest}{suffix}"
+
     def distribution_uri(self, stored_uri: str) -> str:
         return stored_uri
 
@@ -237,6 +251,97 @@ def test_ui_is_served_when_distribution_exists(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert "pyscripts console" in response.text
+
+
+def test_webhook_token_lifecycle_and_provider_events(tmp_path: Path) -> None:
+    app = create_app(
+        Settings(
+            database_url=SecretStr(
+                f"sqlite+aiosqlite:///{tmp_path / 'webhook.db'}"
+            ),
+            grpc_enabled=False,
+            ray_use_label_selector=False,
+            public_base_url="https://pyscripts.example.com/control",
+            webhook_max_body_bytes=1024,
+        )
+    )
+
+    class FailingGitBuilder:
+        def build(self, _git_url: str):
+            raise RuntimeError("expected test failure")
+
+    with TestClient(app) as client:
+        app.state.git_artifact_builder = FailingGitBuilder()
+        service = client.post(
+            "/admin/services",
+            json={
+                "name": "webhook-service",
+                "git_url": "https://example.invalid/webhook.git",
+                "tracking_mode": "webhook",
+            },
+        ).json()
+
+        initial = client.get(f"/admin/services/{service['id']}/webhook")
+        assert initial.status_code == 200
+        assert initial.json() == {
+            "enabled": False,
+            "url": None,
+            "configured_at": None,
+        }
+
+        rotated = client.post(
+            f"/admin/services/{service['id']}/webhook/rotate"
+        )
+        assert rotated.status_code == 200
+        webhook_url = rotated.json()["url"]
+        assert webhook_url.startswith(
+            f"https://pyscripts.example.com/control/hooks/services/{service['id']}/"
+        )
+        hook_path = webhook_url.removeprefix("https://pyscripts.example.com/control")
+
+        hidden = client.get(f"/admin/services/{service['id']}/webhook").json()
+        assert hidden["enabled"] is True
+        assert hidden["url"] is None
+        assert hidden["configured_at"] is not None
+        assert "webhook_token_hash" not in client.get("/admin/services").text
+
+        assert client.post(
+            f"/hooks/services/{service['id']}/wrong-token",
+            headers={"X-Gitea-Event": "push"},
+            content=b"{}",
+        ).status_code == 404
+
+        ignored = client.post(
+            hook_path,
+            headers={"X-Gitea-Event": "ping"},
+            content=b"{}",
+        )
+        assert ignored.status_code == 202
+        assert ignored.json() == {"status": "ignored", "provider": "gitea"}
+
+        too_large = client.post(
+            hook_path,
+            headers={"X-Gitlab-Event": "Push Hook"},
+            content=b"x" * 1025,
+        )
+        assert too_large.status_code == 413
+
+        accepted = client.post(
+            hook_path,
+            headers={"X-Gitlab-Event": "Push Hook"},
+            content=b"{}",
+        )
+        assert accepted.status_code == 202
+        assert accepted.json() == {"status": "accepted", "provider": "gitlab"}
+
+        disabled = client.delete(f"/admin/services/{service['id']}/webhook")
+        assert disabled.status_code == 200
+        assert disabled.json()["enabled"] is False
+        assert client.post(
+            hook_path,
+            headers={"X-Gitea-Event": "push"},
+            content=b"{}",
+        ).status_code == 404
 
 
 def test_revision_persists_object_store_reference(tmp_path: Path) -> None:

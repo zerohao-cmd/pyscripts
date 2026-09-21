@@ -59,11 +59,6 @@ class ContractStatus(str, enum.Enum):
     FAILED = "FAILED"
 
 
-class SdkArtifactStatus(str, enum.Enum):
-    READY = "READY"
-    FAILED = "FAILED"
-
-
 class RuntimeProfileStatus(str, enum.Enum):
     VALIDATING = "VALIDATING"
     READY = "READY"
@@ -92,6 +87,10 @@ class Service(Base):
     git_url: Mapped[str] = mapped_column(Text)
     tracking_mode: Mapped[str] = mapped_column(String(24), default="manual")
     check_interval_seconds: Mapped[int | None] = mapped_column(Integer)
+    webhook_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    webhook_configured_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     runtime_profile: Mapped[str | None] = mapped_column(
         String(256), nullable=True, index=True
     )
@@ -110,6 +109,10 @@ class Service(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+    @property
+    def webhook_enabled(self) -> bool:
+        return self.webhook_token_hash is not None
 
 
 class Revision(Base):
@@ -178,6 +181,7 @@ class RuntimeProfileVersion(Base):
     # a destructive rename; the domain/API name distinguishes this immutable
     # container-level target from the user-managed Python runtime label.
     worker_pool: Mapped[str] = mapped_column("node_pool", String(64))
+    pip_source: Mapped[str] = mapped_column(String(24), default="default")
     requested_dependencies: Mapped[list[str]] = mapped_column(JSON_VALUE)
     resolved_dependencies: Mapped[dict[str, str]] = mapped_column(
         JSON_VALUE, default=dict
@@ -266,6 +270,9 @@ class ApiContract(Base):
     contract_version: Mapped[str] = mapped_column(String(64))
     descriptor_uri: Mapped[str] = mapped_column(Text)
     proto_bundle_uri: Mapped[str] = mapped_column(Text)
+    proto_bundle_digest: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
     methods: Mapped[list[str]] = mapped_column(JSON_VALUE)
     status: Mapped[ContractStatus] = mapped_column(
         Enum(ContractStatus, native_enum=False), default=ContractStatus.READY
@@ -283,41 +290,6 @@ class RevisionContract(Base):
     )
     contract_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("api_contracts.id", ondelete="RESTRICT"), index=True
-    )
-
-
-class SdkArtifact(Base):
-    __tablename__ = "sdk_artifacts"
-    __table_args__ = (
-        UniqueConstraint(
-            "contract_id",
-            "language",
-            "generator_version",
-            name="uq_sdk_contract_language_generator",
-        ),
-        UniqueConstraint(
-            "package_name", "package_version", name="uq_sdk_package_version"
-        ),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    contract_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("api_contracts.id", ondelete="CASCADE"), index=True
-    )
-    language: Mapped[str] = mapped_column(String(32))
-    generator_version: Mapped[str] = mapped_column(String(64))
-    package_name: Mapped[str] = mapped_column(String(256))
-    package_version: Mapped[str] = mapped_column(String(64))
-    artifact_uri: Mapped[str] = mapped_column(Text)
-    artifact_digest: Mapped[str] = mapped_column(String(128))
-    status: Mapped[SdkArtifactStatus] = mapped_column(
-        Enum(SdkArtifactStatus, native_enum=False), default=SdkArtifactStatus.READY
-    )
-    error: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
     )
 
 

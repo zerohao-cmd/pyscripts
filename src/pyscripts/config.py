@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     runtime_env_setup_timeout_seconds: int = Field(default=900, ge=30)
     runtime_profile_retirement_timeout_seconds: float = Field(default=600, gt=0)
     require_registered_runtime_profiles: bool = True
+    private_pip_index_url: SecretStr | None = None
+    private_pip_extra_index_urls: list[SecretStr] = Field(default_factory=list)
+    private_pip_trusted_hosts: list[str] = Field(default_factory=list)
+
+    public_base_url: str | None = None
+    webhook_max_body_bytes: int = Field(default=1024 * 1024, ge=1024)
 
     object_store_enabled: bool = False
     object_store_endpoint_url: str | None = None
@@ -97,7 +103,6 @@ class Settings(BaseSettings):
     grpc_max_send_message_bytes: int = Field(default=4 * 1024 * 1024, gt=0)
 
     contract_artifact_root: Path = Path("/tmp/pyscripts-contracts")
-    sdk_distribution_prefix: str = "pyscripts"
 
     serve_ui: bool = True
     ui_dist_path: Path = Path("ui/dist")

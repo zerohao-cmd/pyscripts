@@ -11,7 +11,12 @@ from pydantic import SecretStr
 
 from pyscripts.api import create_app
 from pyscripts.config import Settings
-from pyscripts.runtime.profiles import RuntimeEnvironmentValidation, build_runtime_env
+from pyscripts.runtime.profiles import (
+    RuntimeEnvironmentValidation,
+    RuntimeProfileValidationError,
+    build_runtime_env,
+    materialize_runtime_env,
+)
 
 
 class FakeRuntimeValidator:
@@ -23,6 +28,7 @@ class FakeRuntimeValidator:
         worker_pool: str,
         dependencies: list[str],
         import_checks: list[str],
+        pip_source: str,
     ) -> RuntimeEnvironmentValidation:
         resolved = {
             canonicalize_name(requirement.name): next(
@@ -54,6 +60,45 @@ class FakeProfileScheduler:
     ) -> bool:
         self.retired.append(environment_digest)
         return True
+
+
+def test_private_pypi_options_are_materialized_without_mutating_template() -> None:
+    template = build_runtime_env(["example==1.2.3"], 900)
+    settings = Settings(
+        database_url=SecretStr("sqlite+aiosqlite:///:memory:"),
+        private_pip_index_url=SecretStr(
+            "https://user:secret@packages.example.com/simple"
+        ),
+        private_pip_extra_index_urls=[
+            SecretStr("https://mirror.example.com/simple")
+        ],
+        private_pip_trusted_hosts=["packages.example.com"],
+    )
+
+    materialized = materialize_runtime_env(template, "private", settings)
+
+    assert "pip_install_options" not in template["pip"]
+    assert materialized["pip"]["pip_install_options"] == [
+        "--disable-pip-version-check",
+        "--no-cache-dir",
+        "--index-url",
+        "https://user:secret@packages.example.com/simple",
+        "--extra-index-url",
+        "https://mirror.example.com/simple",
+        "--trusted-host",
+        "packages.example.com",
+    ]
+
+
+def test_private_pypi_requires_control_plane_configuration() -> None:
+    settings = Settings(database_url=SecretStr("sqlite+aiosqlite:///:memory:"))
+
+    try:
+        materialize_runtime_env(build_runtime_env([], 900), "private", settings)
+    except RuntimeProfileValidationError as error:
+        assert "not configured" in str(error)
+    else:
+        raise AssertionError("private source without an index URL must fail")
 
 
 def build_artifact(
@@ -143,6 +188,7 @@ def test_runtime_profile_lifecycle_and_service_binding(tmp_path: Path) -> None:
         assert version_1["profile_ref"] == "data-default@v1"
         assert version_1["status"] == "ACTIVE"
         assert version_1["worker_pool"] == "default"
+        assert version_1["pip_source"] == "default"
 
         service = client.post(
             "/admin/services",
@@ -190,6 +236,17 @@ def test_runtime_profile_lifecycle_and_service_binding(tmp_path: Path) -> None:
         assert second_revision.status_code == 201, second_revision.text
         assert second_revision.json()["runtime_profile"] == "data-default@v1"
 
+        another_revision = client.post(
+            f"/admin/services/{service['id']}/revisions/import",
+            json={
+                "revision": "rev-2",
+                "artifact_uri": latest_uri,
+                "artifact_digest": latest_digest,
+            },
+        )
+        assert another_revision.status_code == 201, another_revision.text
+        assert another_revision.json()["runtime_profile"] == "data-default@v1"
+
         version_2_response = client.post(
             f"/admin/runtime-labels/{version_1['label_id']}/versions",
             json={
@@ -208,6 +265,8 @@ def test_runtime_profile_lifecycle_and_service_binding(tmp_path: Path) -> None:
         )
         assert activated.status_code == 200, activated.text
         assert activated.json()["status"] == "ACTIVE"
+        # One service can retain several revisions on the same runtime. It must
+        # still contribute exactly one reference to the environment version.
         assert activated.json()["reference_count"] == 2
 
         active_retire = client.post(

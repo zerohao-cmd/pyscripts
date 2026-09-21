@@ -144,6 +144,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .button--ghost:hover, .button--outline:hover { border-color: #58685f; background: var(--surface-soft); }
 .button--danger { border-color: rgb(255 124 118 / 28%); color: #ffc0bc; background: rgb(255 124 118 / 9%); }
 .button--small { min-height: 34px; padding: 0 11px; font-size: 12px; }
+.button--contract-download { min-height: 29px; padding: 0 9px; border-color: rgb(91 176 255 / 22%); border-radius: 7px; color: #a9d7ff; background: rgb(91 176 255 / 8%); font-size: 11px; }
+.button--contract-download:hover:not(:disabled) { border-color: rgb(91 176 255 / 38%); background: rgb(91 176 255 / 13%); }
 .icon-button {
   display: inline-grid;
   width: 42px;
@@ -164,6 +166,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .banner span { overflow: hidden; flex: 1; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 .banner button { border: 0; color: inherit; background: none; font-weight: 700; cursor: pointer; }
 .banner--danger { border-color: rgb(255 124 118 / 28%); color: #ffb2ae; background: rgb(255 124 118 / 8%); }
+.webhook-config { display: flex; flex-direction: column; align-items: stretch; gap: 10px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 10px; background: rgb(255 255 255 / 2%); }
+.webhook-config > span, .webhook-config > small { color: var(--muted); }
+.webhook-config input { width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 7px; color: var(--text); background: #0e1311; }
 
 .metrics-grid, .loading-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
 .metric, .skeleton-card, .panel, .service-rail, .service-detail, .contract-card { border: 1px solid var(--border); background: rgb(18 23 21 / 88%); }
@@ -266,6 +271,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .package-line > div span { color: var(--faint); font-size: 11px; }
 .install-command { display: block; margin: 18px 0 12px; overflow: hidden; padding: 12px; border: 1px solid var(--border); border-radius: 8px; color: #c3d4ca; background: #0c100f; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .contract-actions { flex-wrap: wrap; }
+.contract-download-actions { margin-top: 16px; }
 .contract-meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 18px 0 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
 .contract-meta > div { display: grid; gap: 5px; padding: 13px 8px 13px 0; }
 .contract-meta dt { color: var(--faint); font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }

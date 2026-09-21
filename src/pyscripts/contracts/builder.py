@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import base64
 import hashlib
-import importlib.metadata
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -32,9 +29,6 @@ class ContractBuildError(RuntimeError):
     pass
 
 
-SDK_TEMPLATE_VERSION = "1"
-
-
 @dataclass(frozen=True, slots=True)
 class PublishedContract:
     schema_digest: str
@@ -42,12 +36,8 @@ class PublishedContract:
     contract_version: str
     descriptor_uri: str
     proto_bundle_uri: str
+    proto_bundle_digest: str
     methods: list[str]
-    generator_version: str
-    package_name: str
-    package_version: str
-    wheel_uri: str
-    wheel_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,17 +48,12 @@ class PreparedGeneratedArtifact:
     contract: GrpcContractSpec
 
 
-class PythonSdkPublisher:
-    """Builds deterministic local contract artifacts and a pure-Python wheel."""
+class ProtoContractPublisher:
+    """Build deterministic descriptor and protobuf source artifacts."""
 
-    def __init__(self, artifact_root: Path, distribution_prefix: str = "pyscripts"):
+    def __init__(self, artifact_root: Path):
         self.artifact_root = artifact_root.resolve()
         self.artifact_root.mkdir(parents=True, exist_ok=True)
-        self.distribution_prefix = distribution_prefix
-        grpc_tools_version = importlib.metadata.version("grpcio-tools")
-        self.generator_version = (
-            f"pyscripts-{SDK_TEMPLATE_VERSION};grpcio-tools-{grpc_tools_version}"
-        )
 
     def publish(
         self,
@@ -101,11 +86,9 @@ class PythonSdkPublisher:
             if not proto_files:
                 raise ContractBuildError("proto_root contains no .proto files")
 
-            generated_root = temporary / "generated"
-            generated_root.mkdir()
             generated_descriptor = temporary / "descriptor.pb"
             self._run_protoc(
-                proto_root, proto_files, generated_root, generated_descriptor
+                proto_root, proto_files, generated_descriptor
             )
 
             canonical_descriptor = _canonical_descriptor(
@@ -130,11 +113,6 @@ class PythonSdkPublisher:
 
             schema_digest = _sha256(canonical_descriptor)
             source_digest = _source_digest(proto_root, proto_files)
-            package_name = contract.package_name or (
-                f"{self.distribution_prefix}-{service_name}-sdk"
-            )
-            package_name = _normalize_distribution_name(package_name)
-            package_version = contract.version
             target = (
                 self.artifact_root
                 / _safe_token(service_name)
@@ -144,22 +122,11 @@ class PythonSdkPublisher:
 
             descriptor_target = target / "descriptor.pb"
             proto_target = target / "proto.zip"
-            wheel_name = _wheel_filename(package_name, package_version)
-            wheel_target = target / wheel_name
 
             if not descriptor_target.exists():
                 _atomic_write(descriptor_target, canonical_descriptor)
             if not proto_target.exists():
                 self._build_proto_bundle(proto_root, proto_files, proto_target)
-            if not wheel_target.exists():
-                self._prepare_generated_packages(generated_root)
-                self._build_wheel(
-                    generated_root,
-                    wheel_target,
-                    package_name,
-                    package_version,
-                    service_name,
-                )
 
             methods = sorted(
                 endpoint.grpc.method_path
@@ -172,12 +139,8 @@ class PythonSdkPublisher:
                 contract_version=contract.version,
                 descriptor_uri=descriptor_target.resolve().as_uri(),
                 proto_bundle_uri=proto_target.resolve().as_uri(),
+                proto_bundle_digest=_sha256(proto_target.read_bytes()),
                 methods=methods,
-                generator_version=self.generator_version,
-                package_name=package_name,
-                package_version=package_version,
-                wheel_uri=wheel_target.resolve().as_uri(),
-                wheel_digest=_sha256(wheel_target.read_bytes()),
             )
 
     def prepare_generated_artifact(
@@ -218,13 +181,10 @@ class PythonSdkPublisher:
             proto_path.parent.mkdir(parents=True)
             proto_path.write_text(generated.proto_source, encoding="utf-8")
 
-            compiled_root = temporary / "compiled"
-            compiled_root.mkdir()
             descriptor_path = source_root / GENERATED_DESCRIPTOR_PATH
             self._run_protoc(
                 source_root / generated.contract.proto_root,
                 [proto_path],
-                compiled_root,
                 descriptor_path,
             )
             canonical_descriptor = _canonical_descriptor(descriptor_path.read_bytes())
@@ -266,6 +226,24 @@ class PythonSdkPublisher:
         return path
 
     @staticmethod
+    def read_bytes(uri: str, max_bytes: int = 64 * 1024 * 1024) -> bytes:
+        parsed = urllib.parse.urlparse(uri)
+        if parsed.scheme in {"", "file"}:
+            path = Path(urllib.request.url2pathname(parsed.path or uri))
+            if not path.is_file():
+                raise ContractBuildError(f"contract artifact does not exist: {path}")
+            if path.stat().st_size > max_bytes:
+                raise ContractBuildError("contract artifact exceeds the size limit")
+            return path.read_bytes()
+        if parsed.scheme in {"http", "https"}:
+            with urllib.request.urlopen(uri, timeout=60) as response:
+                payload = response.read(max_bytes + 1)
+            if len(payload) > max_bytes:
+                raise ContractBuildError("contract artifact exceeds the size limit")
+            return payload
+        raise ContractBuildError("contract artifact URI must use file, http, or https")
+
+    @staticmethod
     def _build_augmented_artifact(source_root: Path, target: Path) -> None:
         files = sorted(path for path in source_root.rglob("*") if path.is_file())
         with zipfile.ZipFile(
@@ -285,7 +263,6 @@ class PythonSdkPublisher:
         self,
         proto_root: Path,
         proto_files: list[Path],
-        generated_root: Path,
         descriptor_path: Path,
     ) -> None:
         well_known = Path(grpc_tools.__file__).resolve().parent / "_proto"
@@ -296,9 +273,6 @@ class PythonSdkPublisher:
             "grpc_tools.protoc",
             f"-I{proto_root}",
             f"-I{well_known}",
-            f"--python_out={generated_root}",
-            f"--pyi_out={generated_root}",
-            f"--grpc_python_out={generated_root}",
             "--include_imports",
             f"--descriptor_set_out={descriptor_path}",
             *relative_files,
@@ -313,94 +287,6 @@ class PythonSdkPublisher:
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
             raise ContractBuildError(f"protoc failed: {detail[:4000]}")
-
-    @staticmethod
-    def _prepare_generated_packages(generated_root: Path) -> None:
-        python_files = sorted(generated_root.rglob("*_pb2.py"))
-        if not python_files:
-            raise ContractBuildError("protoc generated no Python modules")
-        directories = {generated_root}
-        for path in python_files:
-            directories.update(path.parents)
-        for directory in directories:
-            if not directory.is_relative_to(generated_root):
-                continue
-            relative = directory.relative_to(generated_root)
-            if relative.parts and not all(
-                part.isidentifier() for part in relative.parts
-            ):
-                raise ContractBuildError(
-                    f"proto output path is not a Python package: {relative}"
-                )
-            (directory / "__init__.py").touch(exist_ok=True)
-
-    def _build_wheel(
-        self,
-        generated_root: Path,
-        target: Path,
-        package_name: str,
-        package_version: str,
-        service_name: str,
-    ) -> None:
-        import_name = _sdk_import_name(package_name)
-        wrapper = generated_root / import_name
-        wrapper.mkdir(exist_ok=True)
-        modules = sorted(
-            path.relative_to(generated_root).with_suffix("")
-            for path in generated_root.rglob("*_pb2.py")
-        )
-        grpc_modules = sorted(
-            path.relative_to(generated_root).with_suffix("")
-            for path in generated_root.rglob("*_pb2_grpc.py")
-        )
-        imports = [
-            f"from {'.'.join(module.parts)} import *  # noqa: F403"
-            for module in [*modules, *grpc_modules]
-        ]
-        (wrapper / "__init__.py").write_text(
-            '"""Generated gRPC client SDK for '
-            + service_name
-            + '."""\n\n'
-            + "\n".join(imports)
-            + "\n",
-            encoding="utf-8",
-        )
-        (wrapper / "__init__.pyi").write_text(
-            "\n".join(imports) + "\n",
-            encoding="utf-8",
-        )
-        (wrapper / "py.typed").touch()
-
-        distribution = package_name.replace("-", "_")
-        dist_info = f"{distribution}-{package_version}.dist-info"
-        payload: dict[str, bytes] = {}
-        for path in sorted(generated_root.rglob("*")):
-            if path.is_file():
-                payload[path.relative_to(generated_root).as_posix()] = path.read_bytes()
-        payload[f"{dist_info}/METADATA"] = (
-            "Metadata-Version: 2.4\n"
-            f"Name: {package_name}\n"
-            f"Version: {package_version}\n"
-            f"Summary: Generated gRPC client SDK for {service_name}\n"
-            "Requires-Python: >=3.12\n"
-            "Requires-Dist: grpcio>=1.74.0\n"
-            "Requires-Dist: protobuf>=6.31.0\n"
-            "\n"
-        ).encode()
-        payload[f"{dist_info}/WHEEL"] = (
-            "Wheel-Version: 1.0\n"
-            f"Generator: pyscripts grpcio-tools {self.generator_version}\n"
-            "Root-Is-Purelib: true\n"
-            "Tag: py3-none-any\n\n"
-        ).encode()
-        record_path = f"{dist_info}/RECORD"
-        records = [
-            f"{name},sha256={_record_digest(content)},{len(content)}"
-            for name, content in sorted(payload.items())
-        ]
-        records.append(f"{record_path},,")
-        payload[record_path] = ("\n".join(records) + "\n").encode()
-        _atomic_zip(target, payload)
 
     @staticmethod
     def _build_proto_bundle(
@@ -487,27 +373,8 @@ def _sha256(payload: bytes) -> str:
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
-def _record_digest(payload: bytes) -> str:
-    return (
-        base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
-    )
-
-
 def _safe_token(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:20]
-
-
-def _normalize_distribution_name(value: str) -> str:
-    return re.sub(r"[-_.]+", "-", value).lower()
-
-
-def _sdk_import_name(package_name: str) -> str:
-    return re.sub(r"\W+", "_", package_name).strip("_").lower()
-
-
-def _wheel_filename(package_name: str, version: str) -> str:
-    distribution = package_name.replace("-", "_")
-    return f"{distribution}-{version}-py3-none-any.whl"
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:

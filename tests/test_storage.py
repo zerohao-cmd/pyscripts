@@ -64,3 +64,37 @@ def test_s3_artifact_store_publishes_by_content_digest(tmp_path: Path) -> None:
     assert store.distribution_uri(stored) == (
         f"http://objects.internal/pyscripts/{expected_key}?expires=3600"
     )
+
+
+def test_s3_artifact_store_publishes_proto_contract_blob(tmp_path: Path) -> None:
+    proto_bundle = tmp_path / "proto.zip"
+    proto_bundle.write_bytes(b"deterministic proto bundle")
+    digest = hashlib.sha256(proto_bundle.read_bytes()).hexdigest()
+    client = FakeS3Client()
+    store = S3ArtifactStore(
+        Settings(
+            database_url=SecretStr("sqlite+aiosqlite:///:memory:"),
+            object_store_enabled=True,
+            object_store_bucket="pyscripts",
+            object_store_artifact_prefix="business/artifacts",
+        ),
+        client=client,
+    )
+
+    stored = store.publish_blob(
+        proto_bundle.as_uri(),
+        f"sha256:{digest}",
+        category="contracts/proto",
+        suffix=".zip",
+        content_type="application/zip",
+    )
+
+    expected_key = (
+        f"business/artifacts/contracts/proto/sha256/{digest[:2]}/{digest}.zip"
+    )
+    assert stored == f"s3://pyscripts/{expected_key}"
+    assert client.uploads[0][2] == expected_key
+    assert client.uploads[0][3] == {
+        "ContentType": "application/zip",
+        "Metadata": {"sha256": digest},
+    }

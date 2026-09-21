@@ -267,7 +267,6 @@ def generate_contract(
         contract=GrpcContractSpec(
             version=str(version),
             proto_root=GENERATED_PROTO_ROOT,
-            package_name=f"pyscripts-{service_name}-sdk",
         ),
         package=package,
         service=service,

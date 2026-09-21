@@ -27,8 +27,6 @@ from pyscripts.models import (
     RuntimeProfileStatus,
     RuntimeProfileVersion,
     RuntimeTrackingMode,
-    SdkArtifact,
-    SdkArtifactStatus,
     Service,
     ServiceStatus,
 )
@@ -44,6 +42,7 @@ from pyscripts.runtime.profiles import (
     validate_project_compatibility,
 )
 from pyscripts.runtime.output import CapturedLogChunk
+
 
 class NotFoundError(LookupError):
     pass
@@ -74,13 +73,13 @@ class ResolvedEndpoint:
     num_cpus: float | None = None
     num_gpus: float | None = None
     io_type: tuple[str, ...] = ("rest",)
+    pip_source: str = "default"
 
 
 @dataclass(frozen=True, slots=True)
 class ContractBundle:
     service: Service
     contract: ApiContract
-    sdk: SdkArtifact
     revision: Revision | None = None
 
 
@@ -169,6 +168,24 @@ class PlatformRepository:
         await self.session.flush()
         return service
 
+    async def configure_service_webhook(
+        self,
+        service_id: uuid.UUID,
+        token_hash: str | None,
+    ) -> Service:
+        service = await self.session.scalar(
+            select(Service).where(Service.id == service_id).with_for_update()
+        )
+        if service is None:
+            raise NotFoundError("service does not exist")
+        service.webhook_token_hash = token_hash
+        service.webhook_configured_at = (
+            datetime.now(UTC) if token_hash is not None else None
+        )
+        service.updated_at = datetime.now(UTC)
+        await self.session.flush()
+        return service
+
     async def create_runtime_label(
         self,
         request: CreateRuntimeLabelRequest,
@@ -221,6 +238,7 @@ class PlatformRepository:
             profile_ref=f"{label.name}@v{version}",
             python_version=request.python_version,
             worker_pool=request.worker_pool,
+            pip_source=request.pip_source,
             requested_dependencies=dependencies,
             import_checks=list(request.import_checks),
             runtime_env=runtime_env,
@@ -231,8 +249,11 @@ class PlatformRepository:
         reference_counts = (
             select(
                 RevisionRuntimeProfile.runtime_profile_version_id.label("version_id"),
-                func.count().label("reference_count"),
+                func.count(func.distinct(Revision.service_id)).label(
+                    "reference_count"
+                ),
             )
+            .join(Revision, Revision.id == RevisionRuntimeProfile.revision_id)
             .group_by(RevisionRuntimeProfile.runtime_profile_version_id)
             .subquery()
         )
@@ -442,8 +463,9 @@ class PlatformRepository:
     async def runtime_profile_reference_count(self, version_id: uuid.UUID) -> int:
         return int(
             await self.session.scalar(
-                select(func.count())
+                select(func.count(func.distinct(Revision.service_id)))
                 .select_from(RevisionRuntimeProfile)
+                .join(Revision, Revision.id == RevisionRuntimeProfile.revision_id)
                 .where(
                     RevisionRuntimeProfile.runtime_profile_version_id == version_id
                 )
@@ -467,7 +489,7 @@ class PlatformRepository:
         references = await self.runtime_profile_reference_count(version.id)
         if references:
             raise InvalidTransitionError(
-                f"runtime profile is referenced by {references} revision(s)"
+                f"runtime profile is referenced by {references} service(s)"
             )
         active_executions = (
             await self.active_runtime_execution_count(version.environment_digest)
@@ -562,7 +584,7 @@ class PlatformRepository:
         self,
         service_id: uuid.UUID,
         published: Any,
-    ) -> tuple[ApiContract, SdkArtifact]:
+    ) -> ApiContract:
         existing = await self.session.scalar(
             select(ApiContract).where(
                 ApiContract.service_id == service_id,
@@ -575,44 +597,26 @@ class PlatformRepository:
                     "the same schema digest is already published with contract version "
                     f"{existing.contract_version}"
                 )
-            sdk = await self.session.scalar(
-                select(SdkArtifact).where(
-                    SdkArtifact.contract_id == existing.id,
-                    SdkArtifact.language == "python",
-                    SdkArtifact.generator_version == published.generator_version,
-                )
-            )
-            if sdk is None:
-                sdk = self._new_sdk(existing.id, published)
-                self.session.add(sdk)
-                await self.session.flush()
-            return existing, sdk
+            existing.descriptor_uri = published.descriptor_uri
+            existing.proto_bundle_uri = published.proto_bundle_uri
+            existing.proto_bundle_digest = published.proto_bundle_digest
+            existing.source_digest = published.source_digest
+            await self.session.flush()
+            return existing
 
-        latest_row = (
-            await self.session.execute(
-                select(ApiContract, SdkArtifact)
-                .join(SdkArtifact, SdkArtifact.contract_id == ApiContract.id)
-                .where(
-                    ApiContract.service_id == service_id,
-                    SdkArtifact.language == "python",
-                    SdkArtifact.status == SdkArtifactStatus.READY,
-                )
-                .order_by(ApiContract.created_at.desc())
-                .limit(1)
-            )
-        ).one_or_none()
-        if latest_row is not None:
-            latest_contract, latest_sdk = latest_row
+        latest_contract = await self.session.scalar(
+            select(ApiContract)
+            .where(ApiContract.service_id == service_id)
+            .order_by(ApiContract.created_at.desc())
+            .limit(1)
+        )
+        if latest_contract is not None:
             if Version(published.contract_version) <= Version(
                 latest_contract.contract_version
             ):
                 raise InvalidTransitionError(
                     "a changed schema requires a contract version newer than "
                     f"{latest_contract.contract_version}"
-                )
-            if published.package_name != latest_sdk.package_name:
-                raise InvalidTransitionError(
-                    "Python SDK package_name cannot change between contract versions"
                 )
 
         contract = ApiContract(
@@ -622,13 +626,11 @@ class PlatformRepository:
             contract_version=published.contract_version,
             descriptor_uri=published.descriptor_uri,
             proto_bundle_uri=published.proto_bundle_uri,
+            proto_bundle_digest=published.proto_bundle_digest,
             methods=published.methods,
             status=ContractStatus.READY,
         )
         self.session.add(contract)
-        await self.session.flush()
-        sdk = self._new_sdk(contract.id, published)
-        self.session.add(sdk)
         await self.session.flush()
         self.session.add(
             OutboxEvent(
@@ -638,25 +640,11 @@ class PlatformRepository:
                     "service_id": str(service_id),
                     "contract_id": str(contract.id),
                     "schema_digest": contract.schema_digest,
-                    "package_name": sdk.package_name,
-                    "package_version": sdk.package_version,
+                    "proto_bundle_digest": contract.proto_bundle_digest,
                 },
             )
         )
-        return contract, sdk
-
-    @staticmethod
-    def _new_sdk(contract_id: uuid.UUID, published: Any) -> SdkArtifact:
-        return SdkArtifact(
-            contract_id=contract_id,
-            language="python",
-            generator_version=published.generator_version,
-            package_name=published.package_name,
-            package_version=published.package_version,
-            artifact_uri=published.wheel_uri,
-            artifact_digest=published.wheel_digest,
-            status=SdkArtifactStatus.READY,
-        )
+        return contract
 
     async def create_revision(
         self,
@@ -673,6 +661,10 @@ class PlatformRepository:
             "spec_version": 1,
             "endpoints": [endpoint.to_manifest() for endpoint in request.endpoints],
         }
+        if request.grpc_contract is not None:
+            manifest["grpc_contract"] = request.grpc_contract.model_dump(
+                mode="json", exclude_none=True
+            )
         tracking_mode = (
             RuntimeTrackingMode.PINNED
             if "@v" in request.runtime_profile
@@ -722,7 +714,7 @@ class PlatformRepository:
         has_grpc = any(endpoint.grpc is not None for endpoint in request.endpoints)
         if has_grpc and contract_id is None:
             raise InvalidTransitionError(
-                "gRPC revision cannot be created before its contract SDK is ready"
+                "gRPC revision cannot be created before its Proto contract is ready"
             )
         if contract_id is not None:
             self.session.add(
@@ -788,16 +780,6 @@ class PlatformRepository:
             _, contract = contract_row
             if contract.status != ContractStatus.READY:
                 raise InvalidTransitionError("revision contract is not ready")
-            sdk_ready = await self.session.scalar(
-                select(SdkArtifact.id).where(
-                    SdkArtifact.contract_id == contract.id,
-                    SdkArtifact.language == "python",
-                    SdkArtifact.status == SdkArtifactStatus.READY,
-                )
-            )
-            if sdk_ready is None:
-                raise InvalidTransitionError("revision Python SDK is not ready")
-
         if service.active_revision_id and service.active_revision_id != revision.id:
             old_revision = await self.session.get(Revision, service.active_revision_id)
             if old_revision is not None:
@@ -882,25 +864,22 @@ class PlatformRepository:
     async def get_active_contract(self, service_name: str) -> ContractBundle:
         row = (
             await self.session.execute(
-                select(Service, Revision, ApiContract, SdkArtifact)
+                select(Service, Revision, ApiContract)
                 .join(Revision, Revision.id == Service.active_revision_id)
                 .join(RevisionContract, RevisionContract.revision_id == Revision.id)
                 .join(ApiContract, ApiContract.id == RevisionContract.contract_id)
-                .join(SdkArtifact, SdkArtifact.contract_id == ApiContract.id)
                 .where(
                     Service.name == service_name,
                     Service.status == ServiceStatus.ACTIVE,
                     Revision.status == RevisionStatus.ACTIVE,
                     ApiContract.status == ContractStatus.READY,
-                    SdkArtifact.language == "python",
-                    SdkArtifact.status == SdkArtifactStatus.READY,
                 )
             )
         ).one_or_none()
         if row is None:
             raise NotFoundError("active gRPC contract does not exist")
-        service, revision, contract, sdk = row
-        return ContractBundle(service, contract, sdk, revision)
+        service, revision, contract = row
+        return ContractBundle(service, contract, revision)
 
     async def get_latest_contract(self, service_id: uuid.UUID) -> ApiContract | None:
         return await self.session.scalar(
@@ -916,21 +895,25 @@ class PlatformRepository:
     async def get_contract(self, contract_id: uuid.UUID) -> ContractBundle:
         row = (
             await self.session.execute(
-                select(Service, ApiContract, SdkArtifact)
+                select(Service, Revision, ApiContract)
                 .join(ApiContract, ApiContract.service_id == Service.id)
-                .join(SdkArtifact, SdkArtifact.contract_id == ApiContract.id)
+                .join(
+                    RevisionContract,
+                    RevisionContract.contract_id == ApiContract.id,
+                )
+                .join(Revision, Revision.id == RevisionContract.revision_id)
                 .where(
                     ApiContract.id == contract_id,
                     ApiContract.status == ContractStatus.READY,
-                    SdkArtifact.language == "python",
-                    SdkArtifact.status == SdkArtifactStatus.READY,
                 )
+                .order_by(Revision.created_at.desc())
+                .limit(1)
             )
-        ).one_or_none()
+        ).first()
         if row is None:
             raise NotFoundError("gRPC contract does not exist")
-        service, contract, sdk = row
-        return ContractBundle(service, contract, sdk)
+        service, revision, contract = row
+        return ContractBundle(service, contract, revision)
 
     async def resolve_endpoint(
         self, service_name: str, endpoint_id: str
@@ -1018,6 +1001,7 @@ class PlatformRepository:
             num_cpus=endpoint_spec.get("num_cpus"),
             num_gpus=endpoint_spec.get("num_gpus"),
             io_type=tuple(endpoint_spec.get("io_type", ["rest"])),
+            pip_source=profile.pip_source if profile else "default",
         )
 
     async def begin_invocation(self, target: ResolvedEndpoint) -> Invocation:

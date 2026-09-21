@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
-import sys
+import shutil
 import zipfile
 from pathlib import Path
 
@@ -130,7 +129,7 @@ type = "Int64"
     return artifact, hashlib.sha256(artifact.read_bytes()).hexdigest()
 
 
-def test_grpc_contract_automatically_publishes_reusable_python_sdk(
+def test_grpc_contract_publishes_persistent_proto_bundle(
     tmp_path: Path,
 ) -> None:
     artifact, digest = _build_artifact(tmp_path)
@@ -143,6 +142,7 @@ def test_grpc_contract_automatically_publishes_reusable_python_sdk(
         Settings(
             database_url=SecretStr(f"sqlite+aiosqlite:///{tmp_path / 'api.db'}"),
             contract_artifact_root=tmp_path / "contracts",
+            actor_cache_root=tmp_path / "runtime",
             grpc_host="127.0.0.1",
             grpc_port=0,
             ray_use_label_selector=False,
@@ -191,36 +191,25 @@ def test_grpc_contract_automatically_publishes_reusable_python_sdk(
         assert contract["contract_version"] == "1.0.0"
         assert contract["revision"] == "rev-1"
         assert contract["methods"] == ["/examples.math.v1.MathService/Add"]
-        assert contract["python_sdk"]["package_name"] == "pyscripts-math-service-sdk"
-        assert contract["python_sdk"]["download_url"].endswith(
-            "pyscripts_math_service_sdk-1.0.0-py3-none-any.whl"
-        )
+        assert "python_sdk" not in contract
+        assert "descriptor_url" not in contract
+        assert contract["proto_bundle_digest"].startswith("sha256:")
 
-        wheel_response = client.get(contract["python_sdk"]["download_url"])
-        assert wheel_response.status_code == 200
-        wheel = tmp_path / "sdk.whl"
-        wheel.write_bytes(wheel_response.content)
-        with zipfile.ZipFile(wheel) as archive:
+        first_proto = client.get(contract["proto_bundle_url"])
+        assert first_proto.status_code == 200
+        shutil.rmtree(tmp_path / "contracts")
+        recovered = client.get("/v1/services/math-service/grpc-contract")
+        assert recovered.status_code == 200, recovered.text
+        contract = recovered.json()
+
+        proto_response = client.get(contract["proto_bundle_url"])
+        assert proto_response.status_code == 200
+        assert proto_response.content == first_proto.content
+        proto_bundle = tmp_path / "proto.zip"
+        proto_bundle.write_bytes(proto_response.content)
+        with zipfile.ZipFile(proto_bundle) as archive:
             names = set(archive.namelist())
-        assert "examples/math/v1/math_pb2.py" in names
-        assert "examples/math/v1/math_pb2_grpc.py" in names
-        assert "pyscripts_math_service_sdk/__init__.py" in names
-        assert any(name.endswith(".dist-info/RECORD") for name in names)
-
-        sys.path.insert(0, str(wheel))
-        try:
-            sdk = importlib.import_module("pyscripts_math_service_sdk")
-            request = sdk.AddRequest(left=2, right=3)
-            assert request.left == 2
-            assert sdk.MathServiceStub is not None
-        finally:
-            sys.path.remove(str(wheel))
-            for module_name in list(sys.modules):
-                if (
-                    module_name == "pyscripts_math_service_sdk"
-                    or module_name.startswith("examples")
-                ):
-                    sys.modules.pop(module_name, None)
+        assert names == {"examples/math/v1/math.proto"}
 
         second_response = client.post(
             f"/admin/services/{service_id}/revisions/import",
@@ -237,13 +226,13 @@ def test_grpc_contract_automatically_publishes_reusable_python_sdk(
         assert second_contract["revision"] == "rev-2"
 
 
-def test_interface_metadata_generates_proto_and_python_sdk(tmp_path: Path) -> None:
+def test_interface_metadata_generates_proto_bundle(tmp_path: Path) -> None:
     artifact, digest = _build_generated_contract_artifact(tmp_path)
     app = create_app(
         Settings(
             database_url=SecretStr(f"sqlite+aiosqlite:///{tmp_path / 'auto.db'}"),
             contract_artifact_root=tmp_path / "contracts-auto",
-            artifact_store_root=tmp_path / "artifacts-auto",
+            actor_cache_root=tmp_path / "runtime-auto",
             grpc_host="127.0.0.1",
             grpc_port=0,
             ray_use_label_selector=False,
@@ -298,31 +287,7 @@ def test_interface_metadata_generates_proto_and_python_sdk(tmp_path: Path) -> No
         assert "rpc Add(AddRequest) returns (AddResponse);" in proto_source
         assert "int64 x = 1;" in proto_source
         assert "int64 y = 2;" in proto_source
-
-        wheel_response = client.get(contract["python_sdk"]["download_url"])
-        assert wheel_response.status_code == 200
-        wheel = tmp_path / "auto-sdk.whl"
-        wheel.write_bytes(wheel_response.content)
-        with zipfile.ZipFile(wheel) as archive:
-            names = set(archive.namelist())
-        assert "service_pb2.py" not in names
-        assert (
-            "pyscripts_auto_math_sdk_proto/v1/service_pb2.py" in names
-        )
-        sys.path.insert(0, str(wheel))
-        try:
-            sdk = importlib.import_module("pyscripts_auto_math_sdk")
-            request = sdk.AddRequest(x=2, y=3)
-            assert request.x == 2
-            assert request.y == 3
-            assert sdk.AutoMathServiceStub is not None
-        finally:
-            sys.path.remove(str(wheel))
-            for module_name in list(sys.modules):
-                if module_name == "pyscripts_auto_math_sdk" or module_name.startswith(
-                    "pyscripts_auto_math_sdk_proto"
-                ):
-                    sys.modules.pop(module_name, None)
+        assert "python_sdk" not in contract
 
         second = client.post(
             f"/admin/services/{service['id']}/revisions/import",

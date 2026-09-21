@@ -72,8 +72,8 @@ api server从manager那里获取到最新的接口数据, 并且启动接口.  �
 详见`./data_design.md`
 
 ### gRPC动态接口
-1. 用户只在endpoint的`io_type`声明`grpc`; 平台根据展平参数与`response_schema`自动生成proto、descriptor和标准强类型Python SDK.
-2. 客户端使用生成的标准强类型Stub, 不直接调用`Invoke(bytes)`信封接口.
+1. 用户只在endpoint的`io_type`声明`grpc`; 平台根据展平参数与`response_schema`自动生成proto和内部descriptor.
+2. 客户端下载proto后按自己的语言工具链生成标准强类型Stub, 不直接调用`Invoke(bytes)`信封接口.
 3. api server启动时只注册一个固定的`GenericRpcHandler`, 根据原生gRPC method path查询不可变RouteRegistry快照.
 4. Gateway不解析业务消息, 将原始protobuf bytes透传到已经固定revision的IO Actor或Compute Task.
 5. 每个revision携带`FileDescriptorSet`, 执行器使用revision独立的DescriptorPool完成请求解码、展平参数调用与响应编码, 禁止注册到全局DescriptorPool.
@@ -81,8 +81,8 @@ api server从manager那里获取到最新的接口数据, 并且启动接口.  �
 7. 字段编号继承上一份descriptor; 删除或改类型的字段号和名称写入`reserved`. 兼容变化自动提升minor, 破坏性变化自动提升major并切换protobuf package版本.
 8. 当前落地范围为unary-unary; streaming需要分别实现对应的RpcMethodHandler并保持调用基数不变.
 9. 发布阶段自动把生成的proto和descriptor加入最终Artifact; 手写`grpc_contract`只作为旧服务兼容模式.
-10. schema digest变化时自动生成不可变Python wheel; code revision变化但schema不变时复用已有SDK.
-11. 新契约的Python SDK未处于READY状态时禁止激活revision.
+10. schema digest变化时自动生成确定性的proto源码包，并把proto包与内部descriptor按digest持久化到对象存储；code revision变化但schema不变时复用已有契约.
+11. 新契约及其对象存储文件未处于READY状态时禁止激活revision；服务重启不得重新生成已发布proto.
 
 ## ray执行层
 k8s提供的ray执行集群

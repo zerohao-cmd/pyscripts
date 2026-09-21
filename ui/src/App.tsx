@@ -24,6 +24,7 @@ import type {
   Service,
   ServiceDetail,
   UpdateServiceInput,
+  WebhookConfig,
   WorkerPool,
 } from "./types";
 
@@ -90,6 +91,11 @@ const endpointMetadataFields = new Set([
 
 function endpointParameters(endpoint: Revision["endpoints"][number]): string[] {
   return Object.keys(endpoint).filter((key) => !endpointMetadataFields.has(key));
+}
+
+function grpcMethodName(service: string, method: string): string {
+  const serviceName = service.split(".").filter(Boolean).at(-1) ?? service;
+  return `${serviceName}/${method}`;
 }
 
 const StatusBadge: Component<{ value: string }> = (props) => {
@@ -160,7 +166,6 @@ const CreateServiceModal: Component<{
   const [interval, setInterval] = createSignal("60");
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
-
   const submit: JSX.EventHandler<HTMLFormElement, SubmitEvent> = async (event) => {
     event.preventDefault();
     setBusy(true);
@@ -238,6 +243,43 @@ const ServiceSettingsModal: Component<{
   );
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
+  const [webhook, setWebhook] = createSignal<WebhookConfig | null>(null);
+  const [webhookBusy, setWebhookBusy] = createSignal(false);
+
+  onMount(() => {
+    void api.serviceWebhook(props.service.id)
+      .then(setWebhook)
+      .catch((caught) => setError(errorMessage(caught)));
+  });
+
+  const rotateWebhook = async () => {
+    setWebhookBusy(true);
+    setError("");
+    try {
+      setWebhook(await api.rotateServiceWebhook(props.service.id));
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setWebhookBusy(false);
+    }
+  };
+
+  const disableWebhook = async () => {
+    setWebhookBusy(true);
+    setError("");
+    try {
+      setWebhook(await api.disableServiceWebhook(props.service.id));
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setWebhookBusy(false);
+    }
+  };
+
+  const copyWebhook = async () => {
+    const url = webhook()?.url;
+    if (url) await navigator.clipboard.writeText(url);
+  };
 
   const submit: JSX.EventHandler<HTMLFormElement, SubmitEvent> = async (event) => {
     event.preventDefault();
@@ -264,7 +306,7 @@ const ServiceSettingsModal: Component<{
         <label class="field">
           <span>服务名称</span>
           <input value={props.service.name} disabled />
-          <small>服务名关联固定调用路径与 SDK，创建后不可修改。</small>
+          <small>服务名关联固定调用路径与 Proto 契约，创建后不可修改。</small>
         </label>
         <label class="field">
           <span>Git 仓库</span>
@@ -289,6 +331,28 @@ const ServiceSettingsModal: Component<{
         <div class="banner">
           <strong>设置只影响后续更新</strong>
           <span>修改 Git 地址或跟踪策略不会改变当前活动 Revision；下一次同步成功后才切换代码。</span>
+        </div>
+        <div class="webhook-config">
+          <strong>Git Webhook</strong>
+          <span>保存 Webhook 跟踪策略后，将下方地址配置为 Gitea 或 GitLab 仓库的 Push Webhook。</span>
+          <Show
+            when={webhook()?.url}
+            fallback={<span>{webhook()?.enabled ? "令牌已经配置；如地址遗失，请轮换令牌生成新地址。" : "尚未生成 Webhook 地址。"}</span>}
+          >
+            <input class="mono" readonly value={webhook()!.url!} onFocus={(event) => event.currentTarget.select()} />
+          </Show>
+          <div class="contract-actions">
+            <button class="button button--outline button--small" type="button" disabled={webhookBusy()} onClick={() => void rotateWebhook()}>
+              <Icon name="refresh" size={15} />{webhook()?.enabled ? "轮换令牌" : "生成地址"}
+            </button>
+            <Show when={webhook()?.url}>
+              <button class="button button--outline button--small" type="button" onClick={() => void copyWebhook()}><Icon name="copy" size={15} />复制地址</button>
+            </Show>
+            <Show when={webhook()?.enabled}>
+              <button class="button button--danger button--small" type="button" disabled={webhookBusy()} onClick={() => void disableWebhook()}>停用</button>
+            </Show>
+          </div>
+          <small>令牌只在生成时返回；平台数据库仅保存 SHA-256 哈希。</small>
         </div>
         <Show when={error()}><div class="form-error">{error()}</div></Show>
         <footer class="modal__footer">
@@ -318,6 +382,12 @@ const RuntimeProfileModal: Component<{
   );
   const [dependencies, setDependencies] = createSignal("");
   const [imports, setImports] = createSignal("");
+  const activeProfile = () => props.label?.versions.find(
+    (version) => version.id === props.label?.active_version_id,
+  );
+  const [pipSource, setPipSource] = createSignal<RuntimeProfileInput["pip_source"]>(
+    activeProfile()?.pip_source ?? "default",
+  );
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
 
@@ -333,6 +403,7 @@ const RuntimeProfileModal: Component<{
       worker_pool: workerPool(),
       dependencies: lines(dependencies()),
       import_checks: lines(imports()),
+      pip_source: pipSource(),
     };
     try {
       const profile = props.label
@@ -380,6 +451,14 @@ const RuntimeProfileModal: Component<{
           <span>依赖锁定（每行一个）</span>
           <textarea class="code-editor compact-editor" rows="7" value={dependencies()} onInput={(event) => setDependencies(event.currentTarget.value)} placeholder={"httpx==0.28.1\npydantic==2.11.7"} spellcheck={false} />
           <small>PyPI 依赖必须使用精确版本；URL 依赖必须包含 #sha256。</small>
+        </label>
+        <label class="field">
+          <span>PyPI 来源</span>
+          <select value={pipSource()} onChange={(event) => setPipSource(event.currentTarget.value as RuntimeProfileInput["pip_source"])}>
+            <option value="default">默认 / 官方源</option>
+            <option value="private">平台私有源</option>
+          </select>
+          <small>私有源地址和凭据由控制面环境变量配置，不会写入项目仓库或接口响应。</small>
         </label>
         <label class="field">
           <span>导入校验（每行一个）</span>
@@ -514,6 +593,8 @@ const App: Component = () => {
   const [healthy, setHealthy] = createSignal(false);
   const [loading, setLoading] = createSignal(true);
   const [refreshing, setRefreshing] = createSignal(false);
+  const [invocationsRefreshing, setInvocationsRefreshing] = createSignal(false);
+  const [serviceInvocationsRefreshing, setServiceInvocationsRefreshing] = createSignal(false);
   const [pageError, setPageError] = createSignal("");
   const [workerPoolError, setWorkerPoolError] = createSignal("");
   const [showCreateService, setShowCreateService] = createSignal(false);
@@ -636,6 +717,30 @@ const App: Component = () => {
     }
   };
 
+  const refreshInvocations = async () => {
+    setInvocationsRefreshing(true);
+    try {
+      setInvocations(await api.invocations(100));
+    } catch (error) {
+      notify(errorMessage(error), "danger");
+    } finally {
+      setInvocationsRefreshing(false);
+    }
+  };
+
+  const refreshServiceInvocations = async () => {
+    const service = selectedService();
+    if (!service) return;
+    setServiceInvocationsRefreshing(true);
+    try {
+      setServiceInvocations(await api.serviceInvocations(service.id, 50));
+    } catch (error) {
+      notify(errorMessage(error), "danger");
+    } finally {
+      setServiceInvocationsRefreshing(false);
+    }
+  };
+
   const activate = async (revision: Revision) => {
     const service = selectedService();
     if (!service || !window.confirm(`激活 revision ${revision.revision}？新请求将立即切换。`)) return;
@@ -670,13 +775,6 @@ const App: Component = () => {
     } catch (error) {
       notify(errorMessage(error), "danger");
     }
-  };
-
-  const copyInstall = async () => {
-    const artifact = contract()?.python_sdk;
-    if (!artifact?.download_url) return;
-    await navigator.clipboard.writeText(`pip install "${artifact.download_url}"`);
-    notify("安装命令已复制");
   };
 
   const openRuntimeModal = (label: RuntimeLabel | null = null) => {
@@ -774,7 +872,7 @@ const App: Component = () => {
               </article>
 
               <article class="panel panel--activity">
-                <header class="panel__header"><div><span class="eyebrow">LIVE LOG</span><h2>最近调用</h2></div><button class="text-button" onClick={() => setView("activity")}>完整记录 <Icon name="chevron" size={15} /></button></header>
+                <header class="panel__header"><div><span class="eyebrow">LIVE LOG</span><h2>最近调用</h2></div><div class="contract-actions"><button class="icon-button icon-button--small" classList={{ "is-spinning": invocationsRefreshing() }} onClick={() => void refreshInvocations()} aria-label="刷新调用记录" title="刷新调用记录"><Icon name="refresh" size={15} /></button><button class="text-button" onClick={() => setView("activity")}>完整记录 <Icon name="chevron" size={15} /></button></div></header>
                 <InvocationTable invocations={invocations()} compact onSelect={(item) => void openInvocation(item)} />
               </article>
             </section>
@@ -831,7 +929,7 @@ const App: Component = () => {
                                   <span>参数</span>
                                   <strong class="mono">{endpointParameters(endpoint).join(", ") || "无"}</strong>
                                 </div>
-                                <Show when={endpoint.grpc}><div class="endpoint-card__meta"><span>gRPC{endpoint.grpc!.generated ? " · AUTO" : ""}</span><strong class="mono">{endpoint.grpc!.service}/{endpoint.grpc!.method}</strong></div></Show>
+                                <Show when={endpoint.grpc}><div class="endpoint-card__meta"><span>gRPC{endpoint.grpc!.generated ? " · AUTO" : ""}</span><strong class="mono" title={`${endpoint.grpc!.service}/${endpoint.grpc!.method}`}>{grpcMethodName(endpoint.grpc!.service, endpoint.grpc!.method)}</strong></div></Show>
                               </article>
                             )}</For>
                           </div>
@@ -858,25 +956,22 @@ const App: Component = () => {
 
                       <section class="contract-layout">
                         <article class="contract-card">
-                          <header><div><span class="eyebrow">gRPC CONTRACT</span><h3>客户端 SDK</h3></div><Icon name="box" /></header>
+                          <header><div><span class="eyebrow">gRPC CONTRACT</span><h3>Proto 契约</h3></div><Icon name="box" /></header>
                           <Show when={contract()} fallback={<EmptyState icon="box" title="没有活动契约" detail="发布带 gRPC endpoint 的 revision 后生成。" />} keyed>
                             {(item) => (
                               <div class="contract-card__body">
-                                <div class="package-line"><span class="package-line__icon">PY</span><div><strong>{item.python_sdk.package_name}</strong><span>v{item.python_sdk.package_version}</span></div><StatusBadge value="READY" /></div>
-                                <code class="install-command">pip install &quot;{item.python_sdk.download_url}&quot;</code>
-                                <div class="contract-actions">
-                                  <button class="button button--outline button--small" onClick={() => void copyInstall()}><Icon name="copy" size={15} />复制安装命令</button>
-                                  <Show when={item.python_sdk.download_url}><a class="button button--primary button--small" href={item.python_sdk.download_url!}><Icon name="download" size={15} />下载 wheel</a></Show>
+                                <div class="package-line"><span class="package-line__icon">PB</span><div><strong>Proto 源码包</strong><span>contract v{item.contract_version}</span></div><StatusBadge value="READY" /></div>
+                                <div class="contract-actions contract-download-actions">
+                                  <a class="button button--contract-download" href={item.proto_bundle_url}><Icon name="download" size={13} />下载 Proto</a>
                                 </div>
-                                <dl class="contract-meta"><div><dt>Schema</dt><dd class="mono">{shortId(item.schema_digest.replace("sha256:", ""), 16)}</dd></div><div><dt>Methods</dt><dd>{item.methods.length}</dd></div><div><dt>Generator</dt><dd class="mono">{item.python_sdk.generator_version}</dd></div></dl>
-                                <div class="artifact-links"><Show when={item.proto_bundle_url}><a href={item.proto_bundle_url!}>Proto 源码</a></Show><Show when={item.descriptor_url}><a href={item.descriptor_url!}>Descriptor</a></Show></div>
+                                <dl class="contract-meta"><div><dt>Schema</dt><dd class="mono">{shortId(item.schema_digest.replace("sha256:", ""), 16)}</dd></div><div><dt>Methods</dt><dd>{item.methods.length}</dd></div><div><dt>Proto</dt><dd class="mono">{shortId(item.proto_bundle_digest.replace("sha256:", ""), 16)}</dd></div></dl>
                               </div>
                             )}
                           </Show>
                         </article>
 
                         <article class="panel service-calls">
-                          <header class="panel__header"><div><span class="eyebrow">SERVICE LOG</span><h3>最近调用</h3></div><span>{serviceInvocations().length}</span></header>
+                          <header class="panel__header"><div><span class="eyebrow">SERVICE LOG</span><h3>最近调用</h3></div><div class="contract-actions"><span>{serviceInvocations().length}</span><button class="icon-button icon-button--small" classList={{ "is-spinning": serviceInvocationsRefreshing() }} onClick={() => void refreshServiceInvocations()} aria-label="刷新服务调用记录" title="刷新服务调用记录"><Icon name="refresh" size={15} /></button></div></header>
                           <InvocationTable invocations={serviceInvocations()} compact onSelect={(item) => void openInvocation(item)} />
                         </article>
                       </section>
@@ -921,13 +1016,13 @@ const App: Component = () => {
                             </div>
                             <div class="runtime-version__pool">
                               <span>WORKER TYPE</span>
-                              <strong class="mono">{profile.worker_pool}</strong>
+                              <strong class="mono">{profile.worker_pool} · {profile.pip_source === "private" ? "private PyPI" : "default PyPI"}</strong>
                             </div>
                             <div class="runtime-version__deps">
                               <span>{profile.requested_dependencies.length} locked deps</span>
                               <small class="mono">{profile.requested_dependencies.slice(0, 2).join(" · ") || "base image only"}</small>
                             </div>
-                            <div class="runtime-version__refs"><strong>{profile.reference_count}</strong><span>引用</span></div>
+                            <div class="runtime-version__refs"><strong>{profile.reference_count}</strong><span>服务引用</span></div>
                             <StatusBadge value={profile.status} />
                             <div class="runtime-version__actions">
                               <Show when={profile.status === "READY"}><button class="button button--primary button--small" onClick={() => void activateRuntime(profile)}>激活</button></Show>
@@ -935,7 +1030,7 @@ const App: Component = () => {
                                 <button class="button button--danger button--small" disabled={profile.status === "RETIRING"} onClick={() => void retireRuntime(profile)}>停用</button>
                               </Show>
                             </div>
-                            <Show when={profile.error}><div class="runtime-version__error">{profile.error}</div></Show>
+                            <Show when={profile.status === "FAILED" && profile.error}><div class="runtime-version__error">{profile.error}</div></Show>
                           </div>
                         )}</For>
                       </div>
@@ -948,7 +1043,7 @@ const App: Component = () => {
 
           <Show when={view() === "activity"}>
             <section class="panel activity-panel">
-              <header class="panel__header panel__header--large"><div><span class="eyebrow">LATEST 100</span><h2>全局调用流水</h2><p>请求状态来自 PostgreSQL invocation 记录。</p></div><div class="legend"><span><i class="legend__dot legend__dot--good" />成功</span><span><i class="legend__dot legend__dot--warn" />执行中</span><span><i class="legend__dot legend__dot--bad" />失败</span></div></header>
+              <header class="panel__header panel__header--large"><div><span class="eyebrow">LATEST 100</span><h2>全局调用流水</h2><p>请求状态来自 PostgreSQL invocation 记录。</p></div><div class="contract-actions"><div class="legend"><span><i class="legend__dot legend__dot--good" />成功</span><span><i class="legend__dot legend__dot--warn" />执行中</span><span><i class="legend__dot legend__dot--bad" />失败</span></div><button class="button button--outline button--small" classList={{ "is-spinning": invocationsRefreshing() }} onClick={() => void refreshInvocations()}><Icon name="refresh" size={15} />刷新</button></div></header>
               <InvocationTable invocations={invocations()} onSelect={(item) => void openInvocation(item)} />
             </section>
           </Show>

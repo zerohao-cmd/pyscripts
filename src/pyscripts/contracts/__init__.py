@@ -1,5 +1,5 @@
-"""Published API contract and generated SDK support."""
+"""Published protobuf contract support."""
 
-from pyscripts.contracts.builder import PublishedContract, PythonSdkPublisher
+from pyscripts.contracts.builder import ProtoContractPublisher, PublishedContract
 
-__all__ = ["PublishedContract", "PythonSdkPublisher"]
+__all__ = ["ProtoContractPublisher", "PublishedContract"]

@@ -2,8 +2,8 @@
 
 本文定义 pyscripts 业务 Artifact 的接口元信息格式。接口配置位于
 `pyproject.toml` 的 `[tool.pyscript]` 命名空间中，用于描述入口函数、
-请求与返回结构、执行类型以及允许的调用协议。gRPC 的 Proto、Descriptor 和 SDK
-由平台生成，不需要业务仓库维护。
+请求与返回结构、执行类型以及允许的调用协议。gRPC 的 Proto 和内部 Descriptor
+由平台生成，不需要业务仓库维护；平台只发布 Proto 源码包，不发布语言 SDK。
 
 manager 检测到 Git 提交变化后，直接读取该提交的 `pyproject.toml`。只有环境与
 接口校验全部通过，才会从相同提交自动生成 Revision 和 Artifact，并将本文结构
@@ -38,7 +38,7 @@ Label 中已安装的版本是否满足项目约束；不兼容时本次 Git 更
 5. manager 检测 Git 提交变化并读取 `pyproject.toml`；
 6. 校验环境标签、Python 版本和外部依赖兼容性；
 7. 校验成功后自动生成 Revision、Artifact URI 和 SHA-256 digest；
-8. 激活 Revision，通过固定 HTTP 路径或生成的 gRPC SDK 调用。
+8. 激活 Revision，通过固定 HTTP 路径或由发布 Proto 生成的强类型 gRPC 客户端调用。
 
 用户不需要手工输入 Revision、Artifact URI 或 digest。Revision 默认使用完整 Git
 commit SHA；Artifact 由 manager 从同一提交构建并上传到内容寻址对象存储。
@@ -140,10 +140,22 @@ Content-Type: application/json
 - `GET /admin/services/{service_id}`：返回服务属性、活动 Revision、运行环境和
   Endpoint 列表；
 - `PATCH /admin/services/{service_id}`：修改 `git_url`、`tracking_mode` 和
-  `check_interval_seconds`。服务名构成公开路径与 SDK 身份，创建后不允许修改。
+  `check_interval_seconds`。服务名构成公开路径与 Proto 契约身份，创建后不允许修改。
 
 切换到 `poll` 时必须同时提供至少 10 秒的检查间隔；切换到 `manual` 或 `webhook`
 时平台清除轮询间隔。属性修改不会直接改变当前活动 Revision。
+
+Webhook 模式下，在 WebUI 的服务设置中生成回调地址，或调用：
+
+```text
+POST   /admin/services/{service_id}/webhook/rotate
+GET    /admin/services/{service_id}/webhook
+DELETE /admin/services/{service_id}/webhook
+```
+
+`rotate` 返回可直接粘贴到 Gitea/GitLab 的完整 URL，且明文令牌只返回一次；`GET`
+只显示是否已启用。Gitea 选择 Push 事件，GitLab 选择 Push events。公网或反向代理
+部署应设置 `PYSCRIPTS_PUBLIC_BASE_URL`，以免生成内部地址。
 
 ### 2. 检测 Git 更新
 
@@ -177,7 +189,7 @@ Revision，也不上传 Artifact。相同 commit SHA 已经处理过时必须保
 4. 按 digest 上传到内容寻址对象存储并得到稳定 Artifact URI；
 5. 写入 Revision、不可变接口 manifest，以及当前解析到的 Runtime Label 版本与
    environment digest；
-6. gRPC schema 变化时生成 SDK；
+6. gRPC schema 变化时生成 Proto 源码包，并按 digest 持久化到对象存储；
 7. 将构建成功的 Revision 置为 `READY`；
 8. 服务处于启用状态时原子激活该 Revision；服务已停止时保留为 `READY`，等待
    用户重新启用。
@@ -415,7 +427,7 @@ additionalProperties = false
 type = "String"
 ```
 
-REST 请求会使用 `{"order": ...}` 作为 JSON body；gRPC SDK 则提供展开后的
+REST 请求会使用 `{"order": ...}` 作为 JSON body；由 Proto 生成的 gRPC 客户端提供展开后的
 `CreateOrderRequest.order` 字段。两条协议最终都调用同一个 Python 签名：
 
 ```python
@@ -428,23 +440,22 @@ async def create_order(order: dict) -> dict:
 - 首次发布按字段名确定稳定编号；后续发布从上一份 Descriptor 继承编号；
 - 参数顺序变化不会改变 Proto；字段删除或类型变化会保留旧编号和字段名为
   `reserved`，不会被后续字段复用；
-- 接口不变时 Descriptor 字节保持一致，复用原有契约与 SDK；
+- 接口不变时 Descriptor 字节保持一致，复用原有契约与 Proto 源码包；
 - 破坏性变化自动提升 major，兼容变化自动提升 minor，用户不填写契约版本；
 - 标量返回值在生成的 Response 中使用 `result` 字段；`Struct` 返回值保持其字段；
 - 当前只支持 unary-unary；用于 gRPC 的 `Struct` 必须设置
   `additionalProperties = false`，且暂不支持嵌套 `List[List[...]]`。
 
-Revision 激活后可以获取契约与自动生成的 Python SDK：
+Revision 激活后可以获取契约元数据与 Proto 源码包：
 
 ```text
 GET /v1/services/{service_name}/grpc-contract
-GET /v1/contracts/{contract_id}/descriptor.pb
 GET /v1/contracts/{contract_id}/proto.zip
-GET /v1/contracts/{contract_id}/python-sdk/{generated-wheel-name}.whl
 ```
 
-客户端使用生成包中的标准 protobuf Message 和 Stub 调用，不需要调用通用
-`Invoke(bytes)` 接口，也不需要手动序列化请求或响应。
+客户端使用 `protoc`、`grpc_tools.protoc`、Buf 或目标语言的标准生成器从 Proto
+生成 protobuf Message 和 Stub，不需要调用通用 `Invoke(bytes)` 接口，也不需要
+手动序列化请求或响应。
 
 已有的手写 Proto 服务仍可通过 `grpc_contract` 和 endpoint `grpc` 字段运行，
 但它属于兼容模式，不能与自动生成模式混用，新服务应只使用 `io_type`。
@@ -549,7 +560,7 @@ manager 解析并发布 Revision 时应执行以下校验：
 | HTTP 调用返回脚本执行失败 | 检查 JSON 键是否与函数参数名一致，并检查调用日志中的具体异常。 |
 | Worker 导入第三方包失败 | 检查构建记录中的依赖校验结果与实际 import 名称是否一致。 |
 | gRPC Struct 提示必须关闭额外字段 | 添加 `additionalProperties = false`，保证 Schema 能映射为固定 Proto 字段。 |
-| 激活返回 `409` | Revision 状态、服务状态或 gRPC SDK 尚不满足激活条件。 |
+| 激活返回 `409` | Revision 状态、服务状态或 gRPC Proto 契约尚不满足激活条件。 |
 
 ## 接入检查清单
 
