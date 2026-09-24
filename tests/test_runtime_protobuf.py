@@ -12,7 +12,9 @@ from pyscripts.contracts.generator import (
     generate_contract,
 )
 from pyscripts.runtime.loader import EndpointDefinition, VersionedRuntime
-from pyscripts.runtime.protobuf import GrpcEndpointDefinition
+from pyscripts.runtime.protobuf import (
+    GrpcEndpointDefinition,
+)
 from pyscripts.schemas import EndpointSpec
 
 

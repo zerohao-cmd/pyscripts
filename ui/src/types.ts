@@ -25,6 +25,7 @@ export interface Service {
   id: string;
   name: string;
   git_url: string;
+  git_branch: string | null;
   tracking_mode: "manual" | "poll" | "webhook";
   check_interval_seconds: number | null;
   status: ServiceStatus;
@@ -80,6 +81,7 @@ export interface Invocation {
   revision_id: string;
   revision: string;
   endpoint_id: string;
+  transport: "REST" | "GRPC" | null;
   status: InvocationStatus;
   error: string | null;
   created_at: string;
@@ -172,12 +174,14 @@ export interface CreateRuntimeLabelInput extends RuntimeProfileInput {
 export interface CreateServiceInput {
   name: string;
   git_url: string;
+  git_branch?: string;
   tracking_mode: "manual" | "poll" | "webhook";
   check_interval_seconds?: number;
 }
 
 export interface UpdateServiceInput {
   git_url?: string;
+  git_branch?: string | null;
   tracking_mode?: "manual" | "poll" | "webhook";
   check_interval_seconds?: number | null;
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import secrets
 import urllib.parse
@@ -58,6 +59,7 @@ from pyscripts.runtime.profiles import (
     validate_project_compatibility,
 )
 from pyscripts.schemas import (
+    ActorPoolStatusResponse,
     ContractResponse,
     CreateRevisionRequest,
     CreateRuntimeLabelRequest,
@@ -121,10 +123,12 @@ def create_app(
             app_settings
         )
         app.state.git_artifact_builder = GitArtifactBuilder()
-        app.state.profile_scheduler = ProfilePoolScheduler(
+        profile_scheduler = ProfilePoolScheduler(
             app_settings,
             artifact_store=app.state.artifact_store,
         )
+        profile_scheduler.start()
+        app.state.profile_scheduler = profile_scheduler
         app.state.runtime_profile_validator = (
             runtime_profile_validator or RayRuntimeEnvironmentValidator(app_settings)
         )
@@ -176,6 +180,7 @@ def create_app(
                     await refresh_task
             if app.state.grpc_gateway is not None:
                 await app.state.grpc_gateway.stop()
+            await profile_scheduler.close()
             await engine.dispose()
 
     app = FastAPI(title="pyscripts", version="0.1.0", lifespan=lifespan)
@@ -287,6 +292,38 @@ def create_app(
                 source=pool.source,
             )
             for pool in pools
+        ]
+
+    @app.get(
+        "/admin/actor-pools",
+        response_model=list[ActorPoolStatusResponse],
+    )
+    async def list_actor_pools(
+        session: SessionDependency,
+    ) -> list[ActorPoolStatusResponse]:
+        # The scheduler learns profiles lazily from invocations. Registering
+        # usable database versions here also makes never-invoked Cold pools
+        # visible without creating an Actor for them.
+        records = await PlatformRepository(session).list_runtime_profiles()
+        for record in records:
+            version = record.version
+            if version.environment_digest is None or version.status not in {
+                RuntimeProfileStatus.READY,
+                RuntimeProfileStatus.ACTIVE,
+                RuntimeProfileStatus.RETIRING,
+            }:
+                continue
+            app.state.profile_scheduler.register_runtime_profile(
+                environment_digest=version.environment_digest,
+                profile_ref=version.profile_ref,
+                worker_pool=version.worker_pool,
+                runtime_env=dict(version.runtime_env or {}),
+                pip_source=version.pip_source,
+            )
+        snapshots = await app.state.profile_scheduler.actor_pool_statuses()
+        return [
+            ActorPoolStatusResponse.model_validate(snapshot)
+            for snapshot in snapshots
         ]
 
     @app.get("/admin/runtime-labels", response_model=list[RuntimeLabelResponse])
@@ -608,6 +645,7 @@ def create_app(
             revision_id=invocation.revision_id,
             revision=record.revision,
             endpoint_id=invocation.endpoint_id,
+            transport=invocation.transport,
             status=invocation.status,
             error=invocation.error,
             created_at=invocation.created_at,
@@ -822,9 +860,11 @@ def create_app(
                 service = await PlatformRepository(session).get_service(service_id)
                 service_name = service.name
                 git_url = service.git_url
+                git_branch = service.git_branch
             artifact = await asyncio.to_thread(
                 app.state.git_artifact_builder.build,
                 git_url,
+                git_branch,
             )
             interface = await asyncio.to_thread(
                 parse_artifact_interface,
@@ -951,10 +991,12 @@ def create_app(
                     status_code=413, detail="webhook payload is too large"
                 )
         received = 0
+        payload_bytes = bytearray()
         async for chunk in request.stream():
             received += len(chunk)
             if received > app_settings.webhook_max_body_bytes:
                 raise HTTPException(status_code=413, detail="webhook payload is too large")
+            payload_bytes.extend(chunk)
 
         gitea_event = request.headers.get("x-gitea-event")
         gitlab_event = request.headers.get("x-gitlab-event")
@@ -971,6 +1013,18 @@ def create_app(
             )
         if not is_push:
             return {"status": "ignored", "provider": provider}
+
+        if service.git_branch is not None:
+            try:
+                payload = json.loads(payload_bytes)
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail="webhook payload must be valid JSON",
+                ) from error
+            pushed_ref = payload.get("ref") if isinstance(payload, dict) else None
+            if pushed_ref != f"refs/heads/{service.git_branch}":
+                return {"status": "ignored", "provider": provider}
 
         task = asyncio.create_task(run_webhook_sync(service_id))
         app.state.background_tasks.add(task)
@@ -1339,7 +1393,10 @@ def create_app(
                 target = await repository.resolve_endpoint(service_name, endpoint_id)
                 if "rest" not in target.io_type:
                     raise NotFoundError("active service REST endpoint does not exist")
-                invocation = await repository.begin_invocation(target)
+                invocation = await repository.begin_invocation(
+                    target,
+                    transport="REST",
+                )
                 request_id = invocation.id
         except NotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error

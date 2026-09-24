@@ -115,12 +115,13 @@ def build_artifact(
         f'dependencies = ["{dependency}"]\n'
         "\n[tool.pyscript]\n"
         "spec_version = 1\n"
-        "\n[tool.pyscript.runtime]\n"
-        f'label = "{profile_ref}"\n'
+        f'runtime = "{profile_ref}"\n'
         "\n[[tool.pyscript.endpoints]]\n"
         'id = "run"\n'
         'task_type = "io"\n'
         'entrypoint = "service:run"\n'
+        'para = { params = "String" }\n'
+        'return = "String"\n'
     )
     with zipfile.ZipFile(artifact, "w") as archive:
         archive.writestr("pyproject.toml", pyproject)

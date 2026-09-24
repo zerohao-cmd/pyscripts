@@ -6,29 +6,10 @@ import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-from grpc_tools import protoc
 from pydantic import SecretStr
 
 from pyscripts.api import create_app
 from pyscripts.config import Settings
-
-PROTO = """syntax = "proto3";
-package examples.math.v1;
-
-service MathService {
-  rpc Add(AddRequest) returns (AddResponse);
-}
-
-message AddRequest {
-  int64 left = 1;
-  int64 right = 2;
-}
-
-message AddResponse {
-  int64 value = 1;
-}
-"""
-
 
 def _build_artifact(
     tmp_path: Path,
@@ -36,27 +17,10 @@ def _build_artifact(
     name: str = "math",
     include_contract: bool = True,
 ) -> tuple[Path, str]:
-    source = tmp_path / f"source-{name}"
-    proto_root = source / "proto"
-    proto_file = proto_root / "examples" / "math" / "v1" / "math.proto"
-    proto_file.parent.mkdir(parents=True)
-    proto_file.write_text(PROTO)
-    descriptor = source / "descriptor.pb"
-    result = protoc.main(
-        [
-            "grpc_tools.protoc",
-            f"-I{proto_root}",
-            "--include_imports",
-            f"--descriptor_set_out={descriptor}",
-            str(proto_file.relative_to(proto_root)),
-        ]
-    )
-    assert result == 0
-
-    contract = (
-        "\n[tool.pyscript.grpc_contract]\n"
-        'version = "1.0.0"\n'
-        'proto_root = "proto"\n'
+    interface = (
+        'io_type = ["rest", "grpc"]\n'
+        'para = { left = "Int64", right = "Int64" }\n'
+        'return = "Int64"\n'
         if include_contract
         else ""
     )
@@ -67,30 +31,19 @@ def _build_artifact(
         'requires-python = ">=3.12,<3.13"\n'
         "\n[tool.pyscript]\n"
         "spec_version = 1\n"
-        "\n[tool.pyscript.runtime]\n"
-        'label = "py312-test"\n'
-        f"{contract}"
+        'runtime = "py312-test"\n'
         "\n[[tool.pyscript.endpoints]]\n"
         'id = "add"\n'
         'task_type = "compute"\n'
         'entrypoint = "service:add"\n'
-        "\n[tool.pyscript.endpoints.grpc]\n"
-        'service = "examples.math.v1.MathService"\n'
-        'method = "Add"\n'
-        'descriptor_path = "descriptor.pb"\n'
+        f"{interface}"
     )
     artifact = tmp_path / f"{name}.zip"
     with zipfile.ZipFile(artifact, "w") as archive:
         archive.writestr("pyproject.toml", pyproject)
-        archive.write(
-            proto_file,
-            "proto/examples/math/v1/math.proto",
-        )
-        archive.write(descriptor, "descriptor.pb")
         archive.writestr(
             "service.py",
-            "def add(context, request):\n"
-            "    return {'value': request.left + request.right}\n",
+            "def add(left, right):\n    return left + right\n",
         )
     return artifact, hashlib.sha256(artifact.read_bytes()).hexdigest()
 
@@ -103,24 +56,15 @@ requires-python = ">=3.12,<3.13"
 
 [tool.pyscript]
 spec_version = 1
-
-[tool.pyscript.runtime]
-label = "py312-test"
+runtime = "py312-test"
 
 [[tool.pyscript.endpoints]]
 id = "add"
 task_type = "compute"
 entrypoint = "service:add"
 io_type = ["rest", "grpc"]
-
-[tool.pyscript.endpoints.x]
-type = "Int64"
-
-[tool.pyscript.endpoints.y]
-type = "Int64"
-
-[tool.pyscript.endpoints.response_schema]
-type = "Int64"
+para = { x = "Int64", y = "Int64" }
+return = "Int64"
 """
     artifact = tmp_path / "auto-math.zip"
     with zipfile.ZipFile(artifact, "w") as archive:
@@ -190,7 +134,9 @@ def test_grpc_contract_publishes_persistent_proto_bundle(
         contract = contract_response.json()
         assert contract["contract_version"] == "1.0.0"
         assert contract["revision"] == "rev-1"
-        assert contract["methods"] == ["/examples.math.v1.MathService/Add"]
+        assert contract["methods"] == [
+            "/pyscripts.generated.math_service.v1.MathService/Add"
+        ]
         assert "python_sdk" not in contract
         assert "descriptor_url" not in contract
         assert contract["proto_bundle_digest"].startswith("sha256:")
@@ -209,7 +155,8 @@ def test_grpc_contract_publishes_persistent_proto_bundle(
         proto_bundle.write_bytes(proto_response.content)
         with zipfile.ZipFile(proto_bundle) as archive:
             names = set(archive.namelist())
-        assert names == {"examples/math/v1/math.proto"}
+        assert len(names) == 1
+        assert next(iter(names)).endswith("/service.proto")
 
         second_response = client.post(
             f"/admin/services/{service_id}/revisions/import",

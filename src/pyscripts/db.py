@@ -42,6 +42,10 @@ def _create_and_upgrade_schema(connection: Connection) -> None:
         connection.exec_driver_sql(
             "ALTER TABLE services ADD COLUMN runtime_profile VARCHAR(256)"
         )
+    if "git_branch" not in service_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE services ADD COLUMN git_branch VARCHAR(255)"
+        )
     if "runtime_tracking_mode" not in service_columns:
         connection.exec_driver_sql(
             "ALTER TABLE services ADD COLUMN runtime_tracking_mode VARCHAR(32)"
@@ -90,6 +94,13 @@ def _create_and_upgrade_schema(connection: Connection) -> None:
         connection.exec_driver_sql(
             "ALTER TABLE invocation_executions "
             "ADD COLUMN logs_truncated BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+    invocation_columns = {
+        column["name"] for column in inspect(connection).get_columns("invocations")
+    }
+    if "transport" not in invocation_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE invocations ADD COLUMN transport VARCHAR(16)"
         )
     log_columns = {
         column["name"]

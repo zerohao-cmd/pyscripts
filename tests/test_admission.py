@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from pyscripts.runtime.admission import AdmissionController, InvalidLeaseError
 
@@ -59,3 +60,16 @@ async def test_unconsumed_lease_expires_and_releases_capacity() -> None:
         pass
     else:
         raise AssertionError("expired lease was accepted")
+
+
+async def test_status_tracks_continuous_idle_time() -> None:
+    admission = AdmissionController(max_io=2, lease_ttl_seconds=10)
+    admission.idle_since = time.monotonic() - 5
+
+    assert (await admission.status())["idle_for_seconds"] >= 5.0
+    lease = await admission.try_reserve("io", "io", "service", "rev")
+    assert lease is not None
+    assert (await admission.status())["idle_for_seconds"] == 0.0
+    assert await admission.cancel_reservation(lease) is True
+    admission.idle_since = time.monotonic() - 10
+    assert (await admission.status())["idle_for_seconds"] >= 10.0

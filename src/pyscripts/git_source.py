@@ -34,24 +34,24 @@ class GitArtifact:
 
 
 class GitArtifactBuilder:
-    """Build an immutable ZIP directly from the tracked Git HEAD."""
+    """Build an immutable ZIP from the selected branch head."""
 
-    def build(self, git_url: str) -> GitArtifact:
+    def build(self, git_url: str, branch: str | None = None) -> GitArtifact:
         temporary_root = Path(tempfile.mkdtemp(prefix="pyscripts-git-"))
         checkout = temporary_root / "checkout"
         artifact = temporary_root / "artifact.zip"
         try:
-            self._run(
+            clone_command = [
                 "git",
                 "clone",
                 "--depth",
                 "1",
                 "--no-tags",
-                "--",
-                git_url,
-                str(checkout),
-                cwd=temporary_root,
-            )
+            ]
+            if branch is not None:
+                clone_command.extend(("--branch", branch, "--single-branch"))
+            clone_command.extend(("--", git_url, str(checkout)))
+            self._run(*clone_command, cwd=temporary_root)
             revision = self._run(
                 "git",
                 "rev-parse",

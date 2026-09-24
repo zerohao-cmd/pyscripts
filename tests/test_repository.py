@@ -70,8 +70,9 @@ async def test_activate_revision_drains_previous_revision() -> None:
         repository = PlatformRepository(session)
         target = await repository.resolve_endpoint("math-service", "add")
         target = replace(target, environment_digest="environment-v1")
-        invocation = await repository.begin_invocation(target)
+        invocation = await repository.begin_invocation(target, transport="REST")
         execution = await session.get(InvocationExecution, invocation.id)
+        assert invocation.transport == "REST"
         assert await repository.active_runtime_execution_count("environment-v1") == 1
         await repository.finish_invocation(invocation.id, InvocationStatus.SUCCEEDED)
         assert await repository.active_runtime_execution_count("environment-v1") == 0

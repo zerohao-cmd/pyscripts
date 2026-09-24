@@ -31,11 +31,26 @@ def connect_ray(settings: Settings) -> None:
     with _ray_init_lock:
         if ray.is_initialized():
             return
+        # Ray Client can leave a disconnected session registered locally
+        # after its data channel exceeds the reconnection grace period. In
+        # that state is_initialized() is false, but a new init() fails with
+        # "already connected with allow_multiple=True" until shutdown clears
+        # the stale client context.
+        ray.shutdown()
         ray.init(
             address=settings.ray_address,
             namespace=settings.ray_namespace,
             ignore_reinit_error=True,
-            runtime_env={"py_modules": [pyscripts_module_path()]},
+            runtime_env={
+                "py_modules": [pyscripts_module_path()],
+                # A Ray Client job can remain in GCS after it has completed.
+                # Eager installation would make every newly autoscaled worker
+                # download the control package for all of those historical
+                # jobs, including packages that have already expired in GCS.
+                # Install this job environment only when one of its actors or
+                # tasks is actually scheduled on the worker instead.
+                "config": {"eager_install": False},
+            },
         )
 
 

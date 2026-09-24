@@ -150,7 +150,8 @@ def generate_contract(
             )
 
         response_schema = endpoint.response_schema
-        if response_schema.get("type") == "Struct":
+        response_type = response_schema.get("type")
+        if response_type == "Struct":
             _require_closed_struct(
                 response_schema, f"endpoint {endpoint.id} response_schema"
             )

@@ -70,7 +70,10 @@ class GrpcInvocationDispatcher:
     ) -> bytes:
         target = route.target
         async with session_scope(self._session_factory) as session:
-            invocation = await PlatformRepository(session).begin_invocation(target)
+            invocation = await PlatformRepository(session).begin_invocation(
+                target,
+                transport="GRPC",
+            )
             request_id = invocation.id
 
         try:

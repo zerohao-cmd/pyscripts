@@ -4,7 +4,7 @@
 ## 用户界面
 用户界面是一个前后端项目, 用户可以在这里注册, 启用, 停用服务, 并且查看服务的运行状态和运行日志
 功能:
-1. 注册服务(git仓库), 设置代码跟踪方式和检查更新时间间隔
+1. 注册服务(git仓库), 可选择跟踪分支, 设置代码跟踪方式和检查更新时间间隔
 2. manager检测Git变化后先校验pyproject.toml引用的环境版本及依赖兼容性，成功后自动生成revision、artifact和digest
 3. 启动服务(通知api server服务可以被使用)
 4. 停止服务(通知api server服务停止)
@@ -22,7 +22,8 @@ manager是项目的核心组件, 其需要对接脚本层, 服务层以及ray调
 
 manager读取git仓库中的pyproject.toml接口定义、逻辑环境标签，以及标准
 `[project].requires-python`和`[project].dependencies`约束。
-服务注册时只配置Git仓库和跟踪策略；运行环境属于Git revision的一部分。
+服务注册时只配置Git仓库、可选跟踪分支和跟踪策略；未指定分支时使用仓库默认分支，
+Webhook只响应目标分支的Push；运行环境属于Git revision的一部分。
 
 服务运行环境设置主要是
 1. python版本
@@ -41,26 +42,14 @@ manager读取git仓库中的pyproject.toml接口定义、逻辑环境标签，�
 ```toml
 [tool.pyscript]
 spec_version = 1
-
-[tool.pyscript.runtime]
-label = "polars-etl"
+runtime = "polars-etl"
 
 [[tool.pyscript.endpoints]]
 id = "data_wash"
 task_type = "compute"
 entrypoint = "src.script:wash"
-
-[tool.pyscript.endpoints.start_date]
-type = "Date"
-
-[tool.pyscript.endpoints.end_date]
-type = "Date"
-
-[tool.pyscript.endpoints.drop_duplicate]
-type = "Bool"
-
-[tool.pyscript.endpoints.response_schema]
-type = "String"
+para = { start_date = "Date", end_date = "Date", drop_duplicate = "Bool" }
+return = "String"
 
 ```
 
@@ -72,7 +61,7 @@ api server从manager那里获取到最新的接口数据, 并且启动接口.  �
 详见`./data_design.md`
 
 ### gRPC动态接口
-1. 用户只在endpoint的`io_type`声明`grpc`; 平台根据展平参数与`response_schema`自动生成proto和内部descriptor.
+1. 用户只在endpoint的`io_type`声明`grpc`; 平台根据`para`展平参数与`return`自动生成proto和内部descriptor.
 2. 客户端下载proto后按自己的语言工具链生成标准强类型Stub, 不直接调用`Invoke(bytes)`信封接口.
 3. api server启动时只注册一个固定的`GenericRpcHandler`, 根据原生gRPC method path查询不可变RouteRegistry快照.
 4. Gateway不解析业务消息, 将原始protobuf bytes透传到已经固定revision的IO Actor或Compute Task.
@@ -80,7 +69,7 @@ api server从manager那里获取到最新的接口数据, 并且启动接口.  �
 6. 路由切换后新请求使用新revision; 已匹配的请求继续持有旧路由, 直到inflight归零后释放旧代码和descriptor.
 7. 字段编号继承上一份descriptor; 删除或改类型的字段号和名称写入`reserved`. 兼容变化自动提升minor, 破坏性变化自动提升major并切换protobuf package版本.
 8. 当前落地范围为unary-unary; streaming需要分别实现对应的RpcMethodHandler并保持调用基数不变.
-9. 发布阶段自动把生成的proto和descriptor加入最终Artifact; 手写`grpc_contract`只作为旧服务兼容模式.
+9. 发布阶段自动把生成的proto和descriptor加入最终Artifact; 不接受手写`grpc_contract`或endpoint `grpc`元数据.
 10. schema digest变化时自动生成确定性的proto源码包，并把proto包与内部descriptor按digest持久化到对象存储；code revision变化但schema不变时复用已有契约.
 11. 新契约及其对象存储文件未处于READY状态时禁止激活revision；服务重启不得重新生成已发布proto.
 
@@ -99,6 +88,8 @@ k8s提供的ray执行集群
 7. runtime profile 更新后，新请求使用新 environment digest；已派发 Task 继续持有旧执行快照直至完成。
 8. Invocation 必须记录 execution kind、artifact digest、runtime profile version 和 environment digest；旧环境只有在 Actor lease 与 Compute invocation 都归零后才能释放。
 9. Compute Task 的本地待提交数量必须有上限；请求取消或超时时同时取消 Ray ObjectRef。
+10. IO Actor 只能由平台按请求频率、执行耗时和当前并发自动伸缩，不向服务用户暴露调度模式；统一采用快扩容、缓缩容。
+11. 承载请求的 Actor 视为 Hot；Hot 达到目标并发或运行环境进入高频状态时，提前创建一个空闲 Warm Actor。流量下降后先延迟回收多余 Actor，最后一个 Warm Actor 使用更长空闲期后缩到零。
 
 ### 两层运行标签
 

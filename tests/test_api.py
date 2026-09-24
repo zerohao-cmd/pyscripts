@@ -53,16 +53,13 @@ def build_artifact(
         'requires-python = ">=3.12,<3.13"\n'
         "\n[tool.pyscript]\n"
         "spec_version = 1\n"
-        "\n[tool.pyscript.runtime]\n"
-        'label = "py312-test"\n'
+        'runtime = "py312-test"\n'
         "\n[[tool.pyscript.endpoints]]\n"
         'id = "run"\n'
         f'task_type = "{task_type}"\n'
         'entrypoint = "service:run"\n'
-        "\n[tool.pyscript.endpoints.value]\n"
-        'type = "Int64"\n'
-        "\n[tool.pyscript.endpoints.response_schema]\n"
-        'type = "Int64"\n'
+        'para = { value = "Int64" }\n'
+        'return = "Int64"\n'
     )
     with zipfile.ZipFile(artifact, "w") as archive:
         archive.writestr("pyproject.toml", pyproject)
@@ -95,12 +92,14 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
             json={
                 "name": "math-service",
                 "git_url": "https://example.invalid/math.git",
+                "git_branch": "release/v1",
                 "tracking_mode": "manual",
             },
         )
         assert service_response.status_code == 201
         service = service_response.json()
         assert service["created_at"]
+        assert service["git_branch"] == "release/v1"
 
         revision_response = client.post(
             f"/admin/services/{service['id']}/revisions/import",
@@ -149,13 +148,22 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
                 "tracking_mode": "poll",
                 "check_interval_seconds": 90,
                 "git_url": "https://example.invalid/math-v2.git",
+                "git_branch": "develop",
             },
         )
         assert updated.status_code == 200, updated.text
         assert updated.json()["tracking_mode"] == "poll"
         assert updated.json()["check_interval_seconds"] == 90
         assert updated.json()["git_url"].endswith("math-v2.git")
+        assert updated.json()["git_branch"] == "develop"
         assert updated.json()["endpoints"][0]["id"] == "run"
+
+        default_branch = client.patch(
+            f"/admin/services/{service['id']}",
+            json={"git_branch": None},
+        )
+        assert default_branch.status_code == 200
+        assert default_branch.json()["git_branch"] is None
 
         manual = client.patch(
             f"/admin/services/{service['id']}",
@@ -163,6 +171,12 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
         )
         assert manual.status_code == 200
         assert manual.json()["check_interval_seconds"] is None
+
+        invalid_branch = client.patch(
+            f"/admin/services/{service['id']}",
+            json={"git_branch": "../invalid"},
+        )
+        assert invalid_branch.status_code == 422
 
         stopped = client.post(f"/admin/services/{service['id']}/stop")
         assert stopped.status_code == 200
@@ -194,6 +208,10 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
         assert invocations.status_code == 200
         assert invocations.json() == []
 
+        actor_pools = client.get("/admin/actor-pools")
+        assert actor_pools.status_code == 200
+        assert actor_pools.json() == []
+
         service_invocations = client.get(
             f"/admin/services/{service['id']}/invocations"
         )
@@ -219,6 +237,7 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
         assert invoked.status_code == 200, invoked.text
         request_id = invoked.json()["request_id"]
         records = client.get("/admin/invocations").json()
+        assert records[0]["transport"] == "REST"
         assert records[0]["has_logs"] is True
         assert records[0]["log_bytes"] == 18
         logs = client.get(f"/admin/invocations/{request_id}/logs")
@@ -267,7 +286,7 @@ def test_webhook_token_lifecycle_and_provider_events(tmp_path: Path) -> None:
     )
 
     class FailingGitBuilder:
-        def build(self, _git_url: str):
+        def build(self, _git_url: str, _git_branch: str | None = None):
             raise RuntimeError("expected test failure")
 
     with TestClient(app) as client:
@@ -277,6 +296,7 @@ def test_webhook_token_lifecycle_and_provider_events(tmp_path: Path) -> None:
             json={
                 "name": "webhook-service",
                 "git_url": "https://example.invalid/webhook.git",
+                "git_branch": "main",
                 "tracking_mode": "webhook",
             },
         ).json()
@@ -326,10 +346,18 @@ def test_webhook_token_lifecycle_and_provider_events(tmp_path: Path) -> None:
         )
         assert too_large.status_code == 413
 
+        wrong_branch = client.post(
+            hook_path,
+            headers={"X-Gitlab-Event": "Push Hook"},
+            json={"ref": "refs/heads/develop"},
+        )
+        assert wrong_branch.status_code == 202
+        assert wrong_branch.json() == {"status": "ignored", "provider": "gitlab"}
+
         accepted = client.post(
             hook_path,
             headers={"X-Gitlab-Event": "Push Hook"},
-            content=b"{}",
+            json={"ref": "refs/heads/main"},
         )
         assert accepted.status_code == 202
         assert accepted.json() == {"status": "accepted", "provider": "gitlab"}
@@ -397,16 +425,17 @@ def test_manual_publish_builds_revision_from_git_head(tmp_path: Path) -> None:
         "dependencies = []\n"
         "\n[tool.pyscript]\n"
         "spec_version = 1\n"
-        "\n[tool.pyscript.runtime]\n"
-        'label = "py312-test@latest"\n'
+        'runtime = "py312-test@latest"\n'
         "\n[[tool.pyscript.endpoints]]\n"
         'id = "run"\n'
         'task_type = "io"\n'
         'entrypoint = "service:run"\n'
+        'para = { value = "String" }\n'
+        'return = "String"\n'
     )
     (repository / "pyproject.toml").write_text(pyproject, encoding="utf-8")
     (repository / "service.py").write_text(
-        "def run(context): return 'ok'\n",
+        "def run(context, value): return value\n",
         encoding="utf-8",
     )
     subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
@@ -432,6 +461,13 @@ def test_manual_publish_builds_revision_from_git_head(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
     ).stdout.strip()
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     app = create_app(
         Settings(
             database_url=SecretStr(
@@ -447,8 +483,13 @@ def test_manual_publish_builds_revision_from_git_head(tmp_path: Path) -> None:
     with TestClient(app) as client:
         service = client.post(
             "/admin/services",
-            json={"name": "git-service", "git_url": str(repository)},
+            json={
+                "name": "git-service",
+                "git_url": str(repository),
+                "git_branch": branch,
+            },
         ).json()
+        assert service["git_branch"] == branch
         first = client.post(f"/admin/services/{service['id']}/revisions")
         assert first.status_code == 201, first.text
         body = first.json()

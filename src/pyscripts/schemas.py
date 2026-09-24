@@ -18,11 +18,46 @@ IMPORT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 RUNTIME_PROFILE_REF = re.compile(
     r"^[a-z][a-z0-9_-]{1,63}(?:@(?:latest|v[1-9][0-9]*))?$"
 )
+ENDPOINT_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
+ENTRYPOINT = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+    r":[A-Za-z_][A-Za-z0-9_]*$"
+)
+
+
+def validate_git_branch_name(value: str) -> str:
+    branch = value.strip()
+    invalid_character = any(
+        character.isspace()
+        or ord(character) < 32
+        or character in "~^:?*[\\"
+        for character in branch
+    )
+    invalid_component = any(
+        not component
+        or component.startswith(".")
+        or component.endswith(".lock")
+        for component in branch.split("/")
+    )
+    if (
+        not branch
+        or branch == "@"
+        or len(branch) > 255
+        or branch.startswith("-")
+        or branch.endswith(("/", "."))
+        or ".." in branch
+        or "@{" in branch
+        or invalid_character
+        or invalid_component
+    ):
+        raise ValueError("git_branch must be a valid Git branch name")
+    return branch
 
 
 class CreateServiceRequest(BaseModel):
     name: str
     git_url: str
+    git_branch: str | None = None
     tracking_mode: Literal["manual", "poll", "webhook"] = "manual"
     check_interval_seconds: int | None = Field(default=None, ge=10)
 
@@ -32,6 +67,11 @@ class CreateServiceRequest(BaseModel):
         if not SERVICE_NAME.fullmatch(value):
             raise ValueError("use 2-64 lowercase letters, digits, '_' or '-'")
         return value
+
+    @field_validator("git_branch")
+    @classmethod
+    def validate_git_branch(cls, value: str | None) -> str | None:
+        return None if value is None else validate_git_branch_name(value)
 
     @model_validator(mode="after")
     def validate_tracking_interval(self) -> CreateServiceRequest:
@@ -48,10 +88,16 @@ class CreateServiceRequest(BaseModel):
 
 class UpdateServiceRequest(BaseModel):
     git_url: str | None = Field(default=None, min_length=1)
+    git_branch: str | None = None
     tracking_mode: Literal["manual", "poll", "webhook"] | None = None
     check_interval_seconds: int | None = Field(default=None, ge=10)
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("git_branch")
+    @classmethod
+    def validate_git_branch(cls, value: str | None) -> str | None:
+        return None if value is None else validate_git_branch_name(value)
 
     @model_validator(mode="after")
     def require_changes(self) -> UpdateServiceRequest:
@@ -116,11 +162,20 @@ class EndpointSpec(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        if not ENDPOINT_ID.fullmatch(value):
+            raise ValueError(
+                "endpoint id must start with a letter or '_' and contain only "
+                "letters, digits, '_' or '-'"
+            )
+        return value
+
     @field_validator("entrypoint")
     @classmethod
     def validate_entrypoint(cls, value: str) -> str:
-        module, separator, function = value.partition(":")
-        if not separator or not module or not function:
+        if not ENTRYPOINT.fullmatch(value):
             raise ValueError("entrypoint must use 'package.module:function'")
         return value
 
@@ -448,10 +503,46 @@ class WorkerPoolResponse(BaseModel):
     mutable: Literal[False] = False
 
 
+class ActorInstanceStatusResponse(BaseModel):
+    replica: int
+    name: str
+    tier: Literal["HOT", "WARM", "DRAINING"]
+    state: str
+    active_io: int
+    max_io: int
+    reserved_leases: int
+    running_leases: int
+    idle_for_seconds: float
+
+
+class ActorPoolStatusResponse(BaseModel):
+    environment_digest: str
+    runtime_profile: str
+    worker_pool: str
+    temperature: Literal["COLD", "WARM", "HOT"]
+    desired_actors: int
+    total_actors: int
+    ready_actors: int
+    creating_actors: int
+    hot_actors: int
+    warm_actors: int
+    draining_actors: int
+    active_io: int
+    reserved_leases: int
+    running_leases: int
+    request_rate_per_second: float
+    average_duration_seconds: float
+    last_request_ago_seconds: float | None
+    target_io_capacity: int
+    max_io_capacity: int
+    actors: list[ActorInstanceStatusResponse]
+
+
 class ServiceResponse(BaseModel):
     id: uuid.UUID
     name: str
     git_url: str
+    git_branch: str | None
     tracking_mode: str
     check_interval_seconds: int | None
     status: str
@@ -505,6 +596,7 @@ class InvocationListItemResponse(BaseModel):
     revision_id: uuid.UUID
     revision: str
     endpoint_id: str
+    transport: Literal["REST", "GRPC"] | None = None
     status: str
     error: str | None
     created_at: datetime

@@ -45,24 +45,15 @@ PLATFORM_TYPES = {
     "Int",
     "Bigint",
 }
-
-SCHEMA_METADATA_FIELDS = {"type", "description", "nullable"}
-STRUCT_FIELDS = SCHEMA_METADATA_FIELDS | {
-    "properties",
-    "required",
-    "additionalProperties",
-}
-LIST_FIELDS = SCHEMA_METADATA_FIELDS | {"items"}
+SCALAR_TYPES = PLATFORM_TYPES - {"List", "Struct"}
 PYPROJECT_MAX_BYTES = 1024 * 1024
 ENDPOINT_METADATA_FIELDS = {
     "id",
     "task_type",
     "entrypoint",
     "io_type",
-    "response_schema",
-    "grpc",
-    "num_cpus",
-    "num_gpus",
+    "para",
+    "return",
 }
 PYTHON_PARAMETER_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -93,7 +84,6 @@ def parse_interface_document(document: Mapping[str, Any]) -> RevisionInterfaceSp
         "spec_version",
         "runtime",
         "endpoints",
-        "grpc_contract",
     }
     if unknown:
         fields = ", ".join(sorted(str(field) for field in unknown))
@@ -104,19 +94,8 @@ def parse_interface_document(document: Mapping[str, Any]) -> RevisionInterfaceSp
         raise InterfaceMetadataError("tool.pyscript.spec_version must be 1")
 
     runtime = tool_metadata.get("runtime")
-    if not isinstance(runtime, Mapping):
-        raise InterfaceMetadataError(
-            "pyproject.toml is missing [tool.pyscript.runtime]"
-        )
-    runtime_unknown = set(runtime) - {"label"}
-    if runtime_unknown:
-        raise InterfaceMetadataError(
-            "unsupported [tool.pyscript.runtime] field(s): "
-            + ", ".join(sorted(str(field) for field in runtime_unknown))
-        )
-    runtime_profile = runtime.get("label")
-    if not isinstance(runtime_profile, str):
-        raise InterfaceMetadataError("tool.pyscript.runtime.label must be a string")
+    if not isinstance(runtime, str):
+        raise InterfaceMetadataError("tool.pyscript.runtime must be a string")
 
     project = document.get("project")
     if not isinstance(project, Mapping):
@@ -141,58 +120,55 @@ def parse_interface_document(document: Mapping[str, Any]) -> RevisionInterfaceSp
             raise InterfaceMetadataError(
                 f"tool.pyscript.endpoints[{index}] must be a table"
             )
-        if "request_schema" in endpoint:
+        unknown_fields = set(endpoint) - ENDPOINT_METADATA_FIELDS
+        if unknown_fields:
             raise InterfaceMetadataError(
-                f"endpoints[{index}].request_schema is not supported; declare "
-                "function parameters directly under the endpoint"
+                f"endpoints[{index}] contains unsupported field(s): "
+                + ", ".join(sorted(str(field) for field in unknown_fields))
             )
-
-        endpoint_metadata = {
-            name: value
-            for name, value in endpoint.items()
-            if name in ENDPOINT_METADATA_FIELDS
-        }
-        if endpoint.get("grpc") is not None and "io_type" not in endpoint_metadata:
-            endpoint_metadata["io_type"] = ["grpc"]
-        parameters: dict[str, dict[str, Any]] = {}
-        for name, schema in endpoint.items():
-            if name in ENDPOINT_METADATA_FIELDS:
-                continue
-            if not isinstance(name, str) or not PYTHON_PARAMETER_NAME.fullmatch(name):
+        if "task_type" not in endpoint:
+            raise InterfaceMetadataError(f"endpoints[{index}].task_type is required")
+        entrypoint = endpoint.get("entrypoint")
+        if not isinstance(entrypoint, str):
+            raise InterfaceMetadataError(f"endpoints[{index}].entrypoint is required")
+        endpoint_id = endpoint.get("id")
+        if endpoint_id is None:
+            _, separator, function_name = entrypoint.partition(":")
+            if not separator or not function_name:
                 raise InterfaceMetadataError(
-                    f"endpoints[{index}] parameter {name!r} is not a valid "
-                    "Python parameter name"
+                    f"endpoints[{index}].entrypoint must use "
+                    "'package.module:function'"
                 )
-            if name == "context":
-                raise InterfaceMetadataError(
-                    f"endpoints[{index}].context is reserved by the platform"
-                )
-            _validate_schema(schema, f"endpoints[{index}].{name}")
-            parameters[name] = dict(schema)
+            endpoint_id = function_name
 
-        if endpoint.get("grpc") is not None and parameters:
-            raise InterfaceMetadataError(
-                f"endpoints[{index}] is a native gRPC endpoint and cannot declare "
-                "flattened HTTP parameters; its protobuf request is passed as one "
-                "positional argument"
-            )
-
-        response_schema = endpoint.get("response_schema")
-        if response_schema is not None:
-            _validate_schema(
-                response_schema,
-                f"endpoints[{index}].response_schema",
-            )
+        if "para" not in endpoint:
+            raise InterfaceMetadataError(f"endpoints[{index}].para is required")
+        parameters = _normalize_parameters(
+            endpoint["para"],
+            f"endpoints[{index}].para",
+        )
+        if "return" not in endpoint:
+            raise InterfaceMetadataError(f"endpoints[{index}].return is required")
+        response_schema = _compact_schema(
+            endpoint["return"],
+            f"endpoints[{index}].return",
+        )
         normalized_endpoints.append(
-            {**endpoint_metadata, "parameters": parameters}
+            {
+                "id": endpoint_id,
+                "task_type": endpoint["task_type"],
+                "entrypoint": entrypoint,
+                "io_type": endpoint.get("io_type", ["rest"]),
+                "parameters": parameters,
+                "response_schema": response_schema,
+            }
         )
 
     try:
         return RevisionInterfaceSpec.model_validate(
             {
                 "endpoints": normalized_endpoints,
-                "grpc_contract": tool_metadata.get("grpc_contract"),
-                "runtime_profile": runtime_profile,
+                "runtime_profile": runtime,
                 "requires_python": requires_python,
                 "dependencies": dependencies,
             }
@@ -203,65 +179,59 @@ def parse_interface_document(document: Mapping[str, Any]) -> RevisionInterfaceSp
         ) from error
 
 
-def _validate_schema(value: Any, path: str) -> None:
+def _normalize_parameters(value: Any, path: str) -> dict[str, dict[str, Any]]:
     if not isinstance(value, Mapping):
-        raise InterfaceMetadataError(f"{path} must be a table")
-    schema_type = value.get("type")
-    if not isinstance(schema_type, str) or schema_type not in PLATFORM_TYPES:
-        raise InterfaceMetadataError(
-            f"{path}.type must be a supported pyscripts data type"
-        )
-    if schema_type == "Struct":
-        _reject_unknown_schema_fields(value, STRUCT_FIELDS, path)
-        properties = value.get("properties", {})
-        if not isinstance(properties, Mapping):
-            raise InterfaceMetadataError(f"{path}.properties must be a table")
-        required = value.get("required", [])
-        if (
-            not isinstance(required, list)
-            or not all(isinstance(item, str) for item in required)
-            or len(required) != len(set(required))
-        ):
-            raise InterfaceMetadataError(
-                f"{path}.required must be an array of unique field names"
-            )
-        additional = value.get("additionalProperties", True)
-        if not isinstance(additional, bool):
-            raise InterfaceMetadataError(
-                f"{path}.additionalProperties must be a boolean"
-            )
-        for name, child in properties.items():
-            if not isinstance(name, str) or not name:
-                raise InterfaceMetadataError(
-                    f"{path}.properties keys must be non-empty strings"
-                )
-            _validate_schema(child, f"{path}.properties.{name}")
-    elif schema_type == "List":
-        _reject_unknown_schema_fields(value, LIST_FIELDS, path)
-        if "items" not in value:
-            raise InterfaceMetadataError(f"{path}.items is required for List")
-        _validate_schema(value["items"], f"{path}.items")
-    else:
-        _reject_unknown_schema_fields(value, SCHEMA_METADATA_FIELDS, path)
-
-    description = value.get("description")
-    if description is not None and not isinstance(description, str):
-        raise InterfaceMetadataError(f"{path}.description must be a string")
-    nullable = value.get("nullable")
-    if nullable is not None and not isinstance(nullable, bool):
-        raise InterfaceMetadataError(f"{path}.nullable must be a boolean")
+        raise InterfaceMetadataError(f"{path} must be a non-empty table")
+    if not value:
+        raise InterfaceMetadataError(f"{path} must not be empty")
+    parameters: dict[str, dict[str, Any]] = {}
+    for name, schema in value.items():
+        _validate_field_name(name, f"{path}.{name}")
+        if name == "context":
+            raise InterfaceMetadataError(f"{path}.context is reserved by the platform")
+        parameters[name] = _compact_schema(schema, f"{path}.{name}")
+    return parameters
 
 
-def _reject_unknown_schema_fields(
-    value: Mapping[str, Any],
-    allowed: set[str],
+def _compact_schema(
+    value: Any,
     path: str,
-) -> None:
-    unknown = set(value) - allowed
-    if unknown:
+) -> dict[str, Any]:
+    if isinstance(value, str):
+        if value not in SCALAR_TYPES:
+            raise InterfaceMetadataError(
+                f"{path} must be a supported scalar pyscripts data type"
+            )
+        return {"type": value}
+    if not isinstance(value, Mapping):
+        raise InterfaceMetadataError(f"{path} must be a type string or table")
+    if not value:
+        raise InterfaceMetadataError(f"{path} must not be an empty table")
+    if "_item" in value:
+        if set(value) != {"_item"}:
+            raise InterfaceMetadataError(
+                f"{path} uses reserved _item and cannot contain other fields"
+            )
+        return {
+            "type": "List",
+            "items": _compact_schema(value["_item"], f"{path}._item"),
+        }
+    properties: dict[str, dict[str, Any]] = {}
+    for name, child in value.items():
+        _validate_field_name(name, f"{path}.{name}")
+        properties[name] = _compact_schema(child, f"{path}.{name}")
+    return {
+        "type": "Struct",
+        "required": list(properties),
+        "additionalProperties": False,
+        "properties": properties,
+    }
+
+
+def _validate_field_name(value: Any, path: str) -> None:
+    if not isinstance(value, str) or not PYTHON_PARAMETER_NAME.fullmatch(value):
         raise InterfaceMetadataError(
-            f"{path} contains unsupported field(s): "
-            + ", ".join(sorted(str(field) for field in unknown))
+            f"{path} is not a valid Python/protobuf field name"
         )
 
 

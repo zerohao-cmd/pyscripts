@@ -162,6 +162,7 @@ const CreateServiceModal: Component<{
 }> = (props) => {
   const [name, setName] = createSignal("");
   const [gitUrl, setGitUrl] = createSignal("");
+  const [gitBranch, setGitBranch] = createSignal("");
   const [tracking, setTracking] = createSignal<CreateServiceInput["tracking_mode"]>("manual");
   const [interval, setInterval] = createSignal("60");
   const [busy, setBusy] = createSignal(false);
@@ -176,6 +177,7 @@ const CreateServiceModal: Component<{
         git_url: gitUrl().trim(),
         tracking_mode: tracking(),
       };
+      if (gitBranch().trim()) body.git_branch = gitBranch().trim();
       if (tracking() === "poll") body.check_interval_seconds = Number(interval());
       props.onCreated(await api.createService(body));
     } catch (caught) {
@@ -196,6 +198,11 @@ const CreateServiceModal: Component<{
         <label class="field">
           <span>Git 仓库</span>
           <input required type="url" value={gitUrl()} onInput={(event) => setGitUrl(event.currentTarget.value)} placeholder="https://git.example.com/team/orders.git" />
+        </label>
+        <label class="field">
+          <span>跟踪分支</span>
+          <input value={gitBranch()} onInput={(event) => setGitBranch(event.currentTarget.value)} placeholder="留空时使用仓库默认分支" />
+          <small>例如 main、develop 或 release/v2</small>
         </label>
         <div class="field-grid">
           <label class="field">
@@ -235,6 +242,7 @@ const ServiceSettingsModal: Component<{
   onUpdated: (service: ServiceDetail) => void;
 }> = (props) => {
   const [gitUrl, setGitUrl] = createSignal(props.service.git_url);
+  const [gitBranch, setGitBranch] = createSignal(props.service.git_branch ?? "");
   const [tracking, setTracking] = createSignal<Service["tracking_mode"]>(
     props.service.tracking_mode,
   );
@@ -288,6 +296,7 @@ const ServiceSettingsModal: Component<{
     try {
       const body: UpdateServiceInput = {
         git_url: gitUrl().trim(),
+        git_branch: gitBranch().trim() || null,
         tracking_mode: tracking(),
         check_interval_seconds:
           tracking() === "poll" ? Number(interval()) : null,
@@ -311,6 +320,11 @@ const ServiceSettingsModal: Component<{
         <label class="field">
           <span>Git 仓库</span>
           <input required type="url" value={gitUrl()} onInput={(event) => setGitUrl(event.currentTarget.value)} />
+        </label>
+        <label class="field">
+          <span>跟踪分支</span>
+          <input value={gitBranch()} onInput={(event) => setGitBranch(event.currentTarget.value)} placeholder="留空时使用仓库默认分支" />
+          <small>修改后从下一次同步开始生效，不会切换当前活动 Revision。</small>
         </label>
         <div class="field-grid">
           <label class="field">
@@ -538,7 +552,7 @@ const InvocationTable: Component<{
             {(item) => (
               <tr class="is-clickable" onClick={() => props.onSelect(item)}>
                 <td><StatusBadge value={item.status} /></td>
-                <td><strong>{item.service}</strong><span class="cell-sub mono">{item.endpoint_id} · {item.execution_kind ?? "LEGACY"}</span></td>
+                <td><strong>{item.service}</strong><span class="cell-sub mono">{item.endpoint_id} · {item.transport === "GRPC" ? "gRPC" : (item.transport ?? "未知")} · {item.execution_kind ?? "LEGACY"}</span></td>
                 <td class="mono muted">{shortId(item.revision, 14)}</td>
                 <td class="mono">{duration(item)}</td>
                 <td class="muted">{formatDate(item.created_at)}<Show when={item.has_logs}><span class="cell-sub log-available">{item.log_bytes} B logs</span></Show></td>
@@ -562,6 +576,7 @@ const InvocationLogModal: Component<{
     <div class="invocation-log-detail">
       <div class="invocation-log-meta">
         <div><span>状态</span><StatusBadge value={props.invocation.status} /></div>
+        <div><span>调用方式</span><strong class="mono">{props.invocation.transport === "GRPC" ? "gRPC" : (props.invocation.transport ?? "未知")}</strong></div>
         <div><span>Request ID</span><code>{props.invocation.id}</code></div>
         <div><span>耗时</span><strong class="mono">{duration(props.invocation)}</strong></div>
         <div><span>输出大小</span><strong class="mono">{props.invocation.log_bytes} B</strong></div>
@@ -861,7 +876,7 @@ const App: Component = () => {
                     <For each={services().slice(0, 8)}>{(service) => (
                       <button class="service-row" onClick={() => selectService(service)}>
                         <span class="service-row__avatar">{service.name.slice(0, 2).toUpperCase()}</span>
-                        <span class="service-row__main"><strong>{service.name}</strong><small><Icon name="git" size={13} />{service.git_url.replace(/^https?:\/\//, "")}</small></span>
+                        <span class="service-row__main"><strong>{service.name}</strong><small><Icon name="git" size={13} />{service.git_url.replace(/^https?:\/\//, "")} · {service.git_branch ?? "默认分支"}</small></span>
                         <StatusBadge value={service.status} />
                         <span class="service-row__revision mono">{shortId(service.active_revision_id)}</span>
                         <Icon name="chevron" size={16} />
@@ -898,7 +913,7 @@ const App: Component = () => {
                   {(service) => (
                     <>
                       <header class="service-hero">
-                        <div><div class="service-hero__title"><h2>{service.name}</h2><StatusBadge value={service.status} /></div><p><Icon name="git" size={15} />{service.git_url}</p></div>
+                        <div><div class="service-hero__title"><h2>{service.name}</h2><StatusBadge value={service.status} /></div><p><Icon name="git" size={15} />{service.git_url} · {service.git_branch ?? "默认分支"}</p></div>
                         <div class="service-hero__actions">
                           <Show when={service.status === "ACTIVE"}><button class="button button--danger" onClick={() => void stop()}><Icon name="stop" />停止</button></Show>
                           <Show when={service.status === "STOPPED" && service.active_revision_id}><button class="button button--primary" onClick={() => void start()}><Icon name="start" />启动</button></Show>
@@ -909,6 +924,7 @@ const App: Component = () => {
 
                       <div class="detail-strip">
                         <div><span>跟踪方式</span><strong>{service.tracking_mode}{service.tracking_mode === "poll" && service.check_interval_seconds ? ` · ${service.check_interval_seconds}s` : ""}</strong></div>
+                        <div><span>Git 分支</span><strong class="mono">{service.git_branch ?? "默认分支"}</strong></div>
                         <div><span>环境来源</span><strong class="mono">pyproject.toml</strong></div>
                         <div><span>活动 revision</span><strong class="mono">{shortId(service.active_revision_id, 18)}</strong></div>
                         <div><span>创建时间</span><strong>{formatDate(service.created_at)}</strong></div>

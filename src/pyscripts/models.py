@@ -85,6 +85,7 @@ class Service(Base):
     )
     name: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     git_url: Mapped[str] = mapped_column(Text)
+    git_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
     tracking_mode: Mapped[str] = mapped_column(String(24), default="manual")
     check_interval_seconds: Mapped[int | None] = mapped_column(Integer)
     webhook_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -309,6 +310,7 @@ class Invocation(Base):
         ForeignKey("revisions.id", ondelete="RESTRICT")
     )
     endpoint_id: Mapped[str] = mapped_column(String(128))
+    transport: Mapped[str | None] = mapped_column(String(16), nullable=True)
     status: Mapped[InvocationStatus] = mapped_column(
         Enum(InvocationStatus, native_enum=False), default=InvocationStatus.ACCEPTED
     )

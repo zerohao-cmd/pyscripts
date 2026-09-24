@@ -45,6 +45,7 @@ class AdmissionController:
         self.actor_draining = False
         self.leases: dict[str, Lease] = {}
         self.lock = asyncio.Lock()
+        self.idle_since: float | None = time.monotonic()
 
     async def try_reserve(
         self,
@@ -63,6 +64,8 @@ class AdmissionController:
                 raise ValueError("IO actors only accept io task leases")
             if self.active_io >= self.max_io:
                 return None
+            if self.active_io == 0:
+                self.idle_since = None
             self.active_io += 1
 
             lease_id = uuid.uuid4().hex
@@ -124,6 +127,11 @@ class AdmissionController:
                 "max_io": self.max_io,
                 "reserved_leases": reserved,
                 "running_leases": running,
+                "idle_for_seconds": (
+                    max(0.0, now - self.idle_since)
+                    if self.idle_since is not None
+                    else 0.0
+                ),
             }
 
     def _state_unlocked(self, now: float) -> ActorState:
@@ -149,3 +157,5 @@ class AdmissionController:
 
     def _release_capacity_unlocked(self, lease: Lease) -> None:
         self.active_io -= 1
+        if self.active_io == 0:
+            self.idle_since = time.monotonic()

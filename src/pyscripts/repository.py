@@ -109,6 +109,7 @@ class PlatformRepository:
         service = Service(
             name=request.name,
             git_url=request.git_url,
+            git_branch=request.git_branch,
             tracking_mode=request.tracking_mode,
             check_interval_seconds=request.check_interval_seconds,
             runtime_profile=None,
@@ -142,6 +143,8 @@ class PlatformRepository:
         if "git_url" in request.model_fields_set:
             assert request.git_url is not None
             service.git_url = request.git_url.strip()
+        if "git_branch" in request.model_fields_set:
+            service.git_branch = request.git_branch
         next_tracking_mode = request.tracking_mode or service.tracking_mode
         next_interval = (
             request.check_interval_seconds
@@ -1004,11 +1007,17 @@ class PlatformRepository:
             pip_source=profile.pip_source if profile else "default",
         )
 
-    async def begin_invocation(self, target: ResolvedEndpoint) -> Invocation:
+    async def begin_invocation(
+        self,
+        target: ResolvedEndpoint,
+        *,
+        transport: str,
+    ) -> Invocation:
         invocation = Invocation(
             service_id=target.service_id,
             revision_id=target.revision_id,
             endpoint_id=target.endpoint_id,
+            transport=transport,
             status=InvocationStatus.RUNNING,
             started_at=datetime.now(UTC),
         )
