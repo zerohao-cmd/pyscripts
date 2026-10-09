@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -11,39 +12,43 @@ from pydantic import SecretStr
 from pyscripts.api import create_app
 from pyscripts.config import Settings
 
+
+def login_admin(client: TestClient) -> None:
+    response = client.post(
+        "/auth/login",
+        json={"password": "test-admin-password"},
+    )
+    assert response.status_code == 200, response.text
+
 def _build_artifact(
     tmp_path: Path,
     *,
     name: str = "math",
     include_contract: bool = True,
 ) -> tuple[Path, str]:
-    interface = (
-        'io_type = ["rest", "grpc"]\n'
-        'para = { left = "Int64", right = "Int64" }\n'
-        'return = "Int64"\n'
-        if include_contract
-        else ""
-    )
     pyproject = (
         "[project]\n"
         f'name = "{name}"\n'
         'version = "1.0.0"\n'
         'requires-python = ">=3.12,<3.13"\n'
         "\n[tool.pyscript]\n"
-        "spec_version = 1\n"
+        "spec_version = 2\n"
         'runtime = "py312-test"\n'
-        "\n[[tool.pyscript.endpoints]]\n"
-        'id = "add"\n'
-        'task_type = "compute"\n'
-        'entrypoint = "service:add"\n'
-        f"{interface}"
+        'module = "service"\n'
     )
     artifact = tmp_path / f"{name}.zip"
     with zipfile.ZipFile(artifact, "w") as archive:
         archive.writestr("pyproject.toml", pyproject)
         archive.writestr(
             "service.py",
-            "def add(left, right):\n    return left + right\n",
+            (
+                "from sc_hook import Int64, IOType, hook\n"
+                "@hook(io_types=[IOType.Rest, IOType.Grpc])\n"
+                "def add(left: Int64, right: Int64) -> Int64:\n"
+                "    return left + right\n"
+                if include_contract
+                else "def ordinary(left, right): return left + right\n"
+            ),
         )
     return artifact, hashlib.sha256(artifact.read_bytes()).hexdigest()
 
@@ -55,21 +60,19 @@ version = "1.0.0"
 requires-python = ">=3.12,<3.13"
 
 [tool.pyscript]
-spec_version = 1
+spec_version = 2
 runtime = "py312-test"
-
-[[tool.pyscript.endpoints]]
-id = "add"
-task_type = "compute"
-entrypoint = "service:add"
-io_type = ["rest", "grpc"]
-para = { x = "Int64", y = "Int64" }
-return = "Int64"
+module = "service"
 """
     artifact = tmp_path / "auto-math.zip"
     with zipfile.ZipFile(artifact, "w") as archive:
         archive.writestr("pyproject.toml", pyproject)
-        archive.writestr("service.py", "def add(x, y):\n    return x + y\n")
+        archive.writestr(
+            "service.py",
+            "from sc_hook import Int64, IOType, hook\n"
+            "@hook(io_types=[IOType.Rest, IOType.Grpc])\n"
+            "def add(x: Int64, y: Int64) -> Int64:\n    return x + y\n",
+        )
     return artifact, hashlib.sha256(artifact.read_bytes()).hexdigest()
 
 
@@ -99,6 +102,7 @@ def test_grpc_contract_publishes_persistent_proto_bundle(
     }
 
     with TestClient(app) as client:
+        login_admin(client)
         service_response = client.post(
             "/admin/services",
             json={
@@ -135,7 +139,8 @@ def test_grpc_contract_publishes_persistent_proto_bundle(
         assert contract["contract_version"] == "1.0.0"
         assert contract["revision"] == "rev-1"
         assert contract["methods"] == [
-            "/pyscripts.generated.math_service.v1.MathService/Add"
+            "/pyscripts.generated."
+            f"math_service_s{uuid.UUID(service_id).hex}.v1.MathService/Add"
         ]
         assert "python_sdk" not in contract
         assert "descriptor_url" not in contract
@@ -143,6 +148,16 @@ def test_grpc_contract_publishes_persistent_proto_bundle(
 
         first_proto = client.get(contract["proto_bundle_url"])
         assert first_proto.status_code == 200
+        client.cookies.clear()
+        catalog_response = client.get("/v1/catalog")
+        assert catalog_response.status_code == 200
+        catalog = catalog_response.json()
+        assert catalog[0]["name"] == "math-service"
+        assert catalog[0]["endpoints"][0]["grpc_method"] == "Add"
+        assert catalog[0]["grpc_contract_url"].endswith("/proto.zip")
+        assert client.get(catalog[0]["grpc_contract_url"]).status_code == 200
+        assert client.get("/admin/services").status_code == 401
+        login_admin(client)
         shutil.rmtree(tmp_path / "contracts")
         recovered = client.get("/v1/services/math-service/grpc-contract")
         assert recovered.status_code == 200, recovered.text
@@ -188,6 +203,7 @@ def test_interface_metadata_generates_proto_bundle(tmp_path: Path) -> None:
     )
 
     with TestClient(app) as client:
+        login_admin(client)
         service = client.post(
             "/admin/services",
             json={
@@ -219,7 +235,8 @@ def test_interface_metadata_generates_proto_bundle(tmp_path: Path) -> None:
         contract = contract_response.json()
         assert contract["contract_version"] == "1.0.0"
         assert contract["methods"] == [
-            "/pyscripts.generated.auto_math.v1.AutoMathService/Add"
+            "/pyscripts.generated."
+            f"auto_math_s{uuid.UUID(service['id']).hex}.v1.AutoMathService/Add"
         ]
 
         proto_response = client.get(contract["proto_bundle_url"])

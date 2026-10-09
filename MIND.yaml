@@ -28,9 +28,9 @@ conponents:
       - "相同method path不得改变unary/streaming调用基数。"
       - "破坏性schema更新使用新的protobuf包或服务版本。"
   execution_actor:
-    note: "按runtime profile部署的统一Ray Actor，支持脚本热加载和IO/Compute互斥调度。"
+    note: "按runtime profile部署的异步IO Actor，支持Hook脚本热加载；Compute由Ray Task执行。"
     current:
-      - "IO任务可共享Actor，Compute任务独占空闲Actor。"
+      - "IO任务共享异步Actor，Compute任务由通用Ray Task执行。"
       - "revision代码加载到独立Python模块命名空间。"
       - "每个revision使用独立DescriptorPool解码请求和校验响应。"
     target:
@@ -40,17 +40,18 @@ conponents:
       - "服务默认无状态，运行代码不得依赖跨请求可变全局状态。"
       - "代码、protobuf类和DescriptorPool必须在inflight归零后一起释放。"
       - "运行时依赖由容器label和不可变runtime profile决定。"
+      - "Hook async函数是IO，普通函数是Compute；IO内remote_call固定当前revision并调度内部任务。"
   sdk_contracts:
-    note: "将gRPC接口契约作为独立于代码revision的版本化产物，并自动生成Python客户端SDK。"
+    note: "将gRPC Proto接口契约作为独立于代码revision的版本化产物。"
     current:
       - "revision发布时重新编译Proto并校验descriptor与源码一致。"
-      - "按规范化schema digest幂等生成Python消息、类型存根、gRPC Stub和wheel。"
-      - "相同schema的代码revision复用已有契约和SDK，不重复生成包。"
-      - "契约和Python SDK未READY时禁止激活包含gRPC接口的revision。"
+      - "按规范化schema digest幂等生成Proto源码包和descriptor。"
+      - "相同schema的代码revision复用已有Proto契约。"
+      - "契约未READY时禁止激活包含gRPC接口的revision。"
     target:
       - "增加Protobuf兼容性分析并根据兼容等级校验contract version。"
       - "将本地契约产物目录替换为对象存储和内部PEP 503包索引。"
-      - "扩展Go、Java和C# SDK生成器。"
+      - "按需增加客户端生成指引。"
     constraint:
       - "SDK package version不可覆盖，同一版本只能对应一个schema digest。"
       - "SDK生成器版本必须记录，构建必须可复现。"

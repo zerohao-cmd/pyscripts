@@ -88,6 +88,14 @@ class CaptureBuffer:
     _lock: threading.RLock = field(default_factory=threading.RLock)
 
     def write(self, stream: LogStream, value: str) -> int:
+        return self.write_at(stream, value, datetime.now(UTC))
+
+    def write_at(
+        self,
+        stream: LogStream,
+        value: str,
+        emitted_at: datetime,
+    ) -> int:
         if not value:
             return 0
         original_length = len(value)
@@ -106,7 +114,7 @@ class CaptureBuffer:
                 value = encoded.decode("utf-8", errors="ignore")
                 encoded = value.encode("utf-8")
                 self._truncated = True
-            self._append(stream, value, datetime.now(UTC))
+            self._append(stream, value, emitted_at)
             self._bytes += len(encoded)
             return original_length
 
@@ -247,3 +255,13 @@ def capture_output(
     finally:
         capture.close()
         _active_capture.reset(token)
+
+
+def replay_captured_output(chunks: tuple[CapturedLogChunk, ...]) -> None:
+    """Merge child-task output into the active parent invocation capture."""
+
+    capture = _active_capture.get()
+    if capture is None:
+        return
+    for chunk in chunks:
+        capture.write_at(chunk.stream, chunk.content, chunk.emitted_at)

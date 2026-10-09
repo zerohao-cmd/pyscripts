@@ -206,7 +206,14 @@ class ProfilePoolScheduler:
         reference = assignment.actor.execute.remote(
             assignment.lease_id,
             target.endpoint_id,
-            {"request_id": str(request_id)},
+            {
+                "request_id": str(request_id),
+                "service": target.service_name,
+                "revision": target.revision,
+                "endpoint": target.endpoint_id,
+                "transport": "http",
+                "internal_call_depth": 0,
+            },
             params,
             artifact_uri,
             target.artifact_digest,
@@ -254,6 +261,7 @@ class ProfilePoolScheduler:
                 "revision": target.revision,
                 "endpoint": target.endpoint_id,
                 "transport": "grpc",
+                "internal_call_depth": 0,
             },
             payload,
             artifact_uri,
@@ -447,6 +455,7 @@ class ProfilePoolScheduler:
             worker_pool=target.worker_pool or target.runtime_profile,
             runtime_env=dict(target.runtime_env or {}),
             pip_source=target.pip_source,
+            pip_index_url=target.pip_index_url,
         )
 
     def register_runtime_profile(
@@ -457,12 +466,14 @@ class ProfilePoolScheduler:
         worker_pool: str,
         runtime_env: dict[str, Any],
         pip_source: str = "default",
+        pip_index_url: str | None = None,
     ) -> PoolProfile:
         """Register immutable metadata so Cold pools are observable."""
         runtime_env = materialize_runtime_env(
             runtime_env,
             pip_source,
             self.settings,
+            pip_index_url,
         )
         profile = PoolProfile(
             key=environment_digest,
@@ -589,6 +600,7 @@ class ProfilePoolScheduler:
                 f"pyscripts-runtime-v4-{digest}-{replica}",
                 f"pyscripts-runtime-v5-{digest}-{replica}",
                 f"pyscripts-runtime-v6-{digest}-{replica}",
+                f"pyscripts-runtime-v7-{digest}-{replica}",
             )
             for actor_name in names:
                 try:
@@ -670,6 +682,12 @@ class ProfilePoolScheduler:
                 self.settings.invocation_log_max_bytes,
                 self.settings.invocation_log_chunk_bytes,
                 self.settings.capture_stderr,
+                profile.worker_pool,
+                self.settings.ray_use_label_selector,
+                self.settings.ray_worker_pool_label_key,
+                self.settings.compute_task_num_cpus,
+                self.settings.compute_task_num_gpus,
+                self.settings.compute_max_pending_per_profile,
             )
         except ValueError:
             # Another gateway/controller may have won the named-actor race.
@@ -1027,4 +1045,4 @@ class ProfilePoolScheduler:
         # Version the detached actor protocol. V7 transfers restart ownership
         # from Ray to the scheduler so old actors are replaced during rollout.
         # Older actors may finish in-flight work before they are reclaimed.
-        return f"pyscripts-runtime-v7-{digest}-{replica}"
+        return f"pyscripts-runtime-v8-{digest}-{replica}"

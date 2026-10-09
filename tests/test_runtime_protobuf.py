@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from pyscripts.contracts.generator import (
     generate_contract,
 )
 from pyscripts.runtime.loader import EndpointDefinition, VersionedRuntime
+from pyscripts.runtime.output import ExecutionOutcome
 from pyscripts.runtime.protobuf import (
     GrpcEndpointDefinition,
 )
@@ -120,7 +122,11 @@ async def test_generated_grpc_flattens_request_into_python_arguments(
         parameters={"x": {"type": "Int64"}, "y": {"type": "Int64"}},
         response_schema={"type": "Int64"},
     )
-    generated = generate_contract("math-service", [spec])
+    generated = generate_contract(
+        "math-service",
+        [spec],
+        service_id=uuid.UUID("11111111-2222-3333-4444-555555555555"),
+    )
     assert generated is not None
 
     proto_root = tmp_path / "proto"
@@ -155,7 +161,10 @@ async def test_generated_grpc_flattens_request_into_python_arguments(
             GENERATED_DESCRIPTOR_PATH,
             descriptor_path.read_bytes(),
         )
-        archive.writestr("service.py", "def add(x, y):\n    return x + y\n")
+        archive.writestr(
+            "service.py",
+            "def add(x, y):\n    print('adding values')\n    return x + y\n",
+        )
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
     generated_grpc = generated.endpoints[0].grpc
     assert generated_grpc is not None
@@ -182,11 +191,25 @@ async def test_generated_grpc_flattens_request_into_python_arguments(
         "math-service",
         "rev-1",
         "add",
-        {"request_id": "request-1", "revision": "rev-1"},
+        {
+            "request_id": "request-1",
+            "service": "math-service",
+            "revision": "rev-1",
+            "endpoint": "add",
+        },
         request_type(x=7, y=5).SerializeToString(),
         artifact_uri=artifact.as_uri(),
         artifact_digest=digest,
         endpoints=endpoints,
+        capture=True,
     )
 
-    assert response_type.FromString(payload).result == 12
+    assert isinstance(payload, ExecutionOutcome)
+    assert payload.succeeded is True
+    response = response_type.FromString(payload.value)
+    assert response.result == 12
+    assert response.execution.request_id == "request-1"
+    assert response.execution.revision == "rev-1"
+    assert response.execution.status == 1
+    assert response.execution.logs[0].stream == 1
+    assert response.execution.logs[0].content == "adding values\n"

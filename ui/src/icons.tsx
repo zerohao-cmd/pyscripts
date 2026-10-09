@@ -16,6 +16,7 @@ export type IconName =
   | "settings"
   | "start"
   | "stop"
+  | "trash"
   | "x";
 
 export const Icon: Component<{ name: IconName; size?: number }> = (props) => {
@@ -62,6 +63,8 @@ export const Icon: Component<{ name: IconName; size?: number }> = (props) => {
       return <svg {...common}><path d="m8 5 11 7-11 7V5Z" /></svg>;
     case "stop":
       return <svg {...common}><rect x="5" y="5" width="14" height="14" rx="2" /></svg>;
+    case "trash":
+      return <svg {...common}><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5" /></svg>;
     case "x":
       return <svg {...common}><path d="m6 6 12 12M18 6 6 18" /></svg>;
   }

@@ -148,6 +148,7 @@ class ProtoContractPublisher:
         service_name: str,
         request: ResolvedRevisionRequest,
         *,
+        service_id: uuid.UUID,
         previous_descriptor: bytes | None = None,
         previous_version: str | None = None,
     ) -> PreparedGeneratedArtifact | None:
@@ -155,6 +156,7 @@ class ProtoContractPublisher:
             generated = generate_contract(
                 service_name,
                 request.endpoints,
+                service_id=service_id,
                 previous_descriptor=previous_descriptor,
                 previous_version=previous_version,
             )

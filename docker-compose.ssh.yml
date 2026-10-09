@@ -1,0 +1,7 @@
+services:
+  pyscripts:
+    volumes:
+      - type: bind
+        source: ${PYSCRIPTS_GIT_SSH_DIR:?set PYSCRIPTS_GIT_SSH_DIR to a dedicated SSH credential directory}
+        target: /home/pyscripts/.ssh
+        read_only: true

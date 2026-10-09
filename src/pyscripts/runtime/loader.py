@@ -18,11 +18,13 @@ import uuid
 import zipfile
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from google.protobuf import descriptor_pool
+from sc_hook import RemoteCallBackend, RemoteFunc, use_remote_call_backend
 
 from pyscripts.runtime.protobuf import (
     GrpcCodec,
@@ -369,6 +371,13 @@ class VersionedRuntime:
                     raise RuntimeLoadError(
                         f"entrypoint {endpoint.entrypoint!r} is not callable"
                     )
+                if (
+                    isinstance(runner, RemoteFunc)
+                    and runner.task_type.value != endpoint.task_type
+                ):
+                    raise RuntimeLoadError(
+                        f"Hook task type for {endpoint.id!r} does not match manifest"
+                    )
                 runners[endpoint.id] = (endpoint.task_type, runner)
             protobuf_pool, grpc_codecs = load_grpc_codecs(
                 version_root,
@@ -411,6 +420,7 @@ class VersionedRuntime:
         artifact_digest: str,
         endpoints: list[EndpointDefinition],
         capture: bool = False,
+        remote_call_backend: RemoteCallBackend | None = None,
     ) -> Any:
         loaded = await self.ensure_loaded(
             service,
@@ -431,12 +441,18 @@ class VersionedRuntime:
         scope_token = _artifact_import_scope.set(loaded.import_scope)
         try:
             invoke = self._invoke_runner_captured if capture else self._invoke_runner
-            return await invoke(
-                task_type,
-                runner,
-                dict(context),
-                keyword_arguments=dict(params),
+            backend_scope = (
+                use_remote_call_backend(remote_call_backend)
+                if remote_call_backend is not None
+                else nullcontext()
             )
+            with backend_scope:
+                return await invoke(
+                    task_type,
+                    runner,
+                    dict(context),
+                    keyword_arguments=dict(params),
+                )
         finally:
             _artifact_import_scope.reset(scope_token)
             await self._release(loaded)
@@ -453,6 +469,7 @@ class VersionedRuntime:
         artifact_digest: str,
         endpoints: list[EndpointDefinition],
         capture: bool = False,
+        remote_call_backend: RemoteCallBackend | None = None,
     ) -> bytes | ExecutionOutcome:
         loaded = await self.ensure_loaded(
             service,
@@ -478,24 +495,39 @@ class VersionedRuntime:
         try:
             request = codec.parse_request(payload)
             invoke = self._invoke_runner_captured if capture else self._invoke_runner
-            if endpoint.grpc.generated:
-                result = await invoke(
-                    task_type,
-                    runner,
-                    dict(context),
-                    keyword_arguments=generated_request_arguments(
-                        request, endpoint.parameters
-                    ),
-                )
-            else:
-                result = await invoke(
-                    task_type,
-                    runner,
-                    dict(context),
-                    positional_arguments=(request,),
-                )
+            backend_scope = (
+                use_remote_call_backend(remote_call_backend)
+                if remote_call_backend is not None
+                else nullcontext()
+            )
+            with backend_scope:
+                if endpoint.grpc.generated:
+                    result = await invoke(
+                        task_type,
+                        runner,
+                        dict(context),
+                        keyword_arguments=generated_request_arguments(
+                            request, endpoint.parameters
+                        ),
+                    )
+                else:
+                    result = await invoke(
+                        task_type,
+                        runner,
+                        dict(context),
+                        positional_arguments=(request,),
+                    )
             if isinstance(result, ExecutionOutcome):
+                execution = (
+                    _generated_execution_metadata(context, result)
+                    if endpoint.grpc.generated
+                    else None
+                )
                 if not result.succeeded:
+                    if endpoint.grpc.generated and execution is not None:
+                        return result.with_value(
+                            codec.serialize_response({"execution": execution})
+                        )
                     return result
                 value = result.value
                 if endpoint.grpc.generated:
@@ -503,6 +535,7 @@ class VersionedRuntime:
                         value,
                         endpoint.response_schema,
                         wrapped=endpoint.grpc.response_wrapped,
+                        execution=execution,
                     )
                 return result.with_value(codec.serialize_response(value))
             if endpoint.grpc.generated:
@@ -510,6 +543,11 @@ class VersionedRuntime:
                     result,
                     endpoint.response_schema,
                     wrapped=endpoint.grpc.response_wrapped,
+                    execution=(
+                        _generated_execution_metadata(context)
+                        if endpoint.grpc.generated
+                        else None
+                    ),
                 )
             return codec.serialize_response(result)
         finally:
@@ -528,16 +566,28 @@ class VersionedRuntime:
         kwargs = keyword_arguments or {}
         prefix = (context,) if self._declares_context(runner) else ()
         args = (*prefix, *positional_arguments)
-        if inspect.iscoroutinefunction(runner):
-            return await runner(*args, **kwargs)
+        if task_type == "io" and (
+            inspect.iscoroutinefunction(runner) or isinstance(runner, RemoteFunc)
+        ):
+            result = runner(*args, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            raise RuntimeLoadError("IO Hook endpoint did not return an awaitable")
+        if task_type == "compute" and inspect.iscoroutinefunction(runner):
+            raise RuntimeLoadError("Compute endpoint must use a synchronous function")
         loop = asyncio.get_running_loop()
         executor = self._io_executor if task_type == "io" else self._compute_executor
         context_copy = contextvars.copy_context()
-        return await loop.run_in_executor(
+        result = await loop.run_in_executor(
             executor,
             context_copy.run,
             lambda: runner(*args, **kwargs),
         )
+        if inspect.isawaitable(result):
+            raise RuntimeLoadError(
+                "Compute endpoint returned an awaitable; use async def for IO"
+            )
+        return result
 
     async def _invoke_runner_captured(
         self,
@@ -649,3 +699,40 @@ class VersionedRuntime:
                 for item in versions
             ]
         }
+
+
+def _generated_execution_metadata(
+    context: Mapping[str, Any],
+    outcome: ExecutionOutcome | None = None,
+) -> dict[str, Any]:
+    error = ""
+    if outcome is not None and not outcome.succeeded:
+        error = ": ".join(
+            part
+            for part in (outcome.error_type, outcome.error_message)
+            if part
+        )[:4000]
+    logs = outcome.logs if outcome is not None else ()
+    return {
+        "request_id": str(context.get("request_id", "")),
+        "service": str(context.get("service", "")),
+        "revision": str(context.get("revision", "")),
+        "endpoint": str(context.get("endpoint", "")),
+        "status": (
+            "PYSCRIPTS_EXECUTION_STATUS_FAILED"
+            if outcome is not None and not outcome.succeeded
+            else "PYSCRIPTS_EXECUTION_STATUS_SUCCEEDED"
+        ),
+        "error": error,
+        "logs": [
+            {
+                "sequence": chunk.sequence,
+                "stream": f"PYSCRIPTS_LOG_STREAM_{chunk.stream}",
+                "content": chunk.content,
+                "emitted_at": chunk.emitted_at.isoformat().replace("+00:00", "Z"),
+            }
+            for chunk in logs
+        ],
+        "log_bytes": outcome.log_bytes if outcome is not None else 0,
+        "logs_truncated": outcome.logs_truncated if outcome is not None else False,
+    }

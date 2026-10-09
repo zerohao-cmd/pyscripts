@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from packaging.requirements import Requirement
@@ -16,7 +17,16 @@ from pyscripts.runtime.profiles import (
     RuntimeProfileValidationError,
     build_runtime_env,
     materialize_runtime_env,
+    validate_project_compatibility,
 )
+
+
+def login_admin(client: TestClient) -> None:
+    response = client.post(
+        "/auth/login",
+        json={"password": "test-admin-password"},
+    )
+    assert response.status_code == 200, response.text
 
 
 class FakeRuntimeValidator:
@@ -29,6 +39,7 @@ class FakeRuntimeValidator:
         dependencies: list[str],
         import_checks: list[str],
         pip_source: str,
+        pip_index_url: str | None,
     ) -> RuntimeEnvironmentValidation:
         resolved = {
             canonicalize_name(requirement.name): next(
@@ -101,6 +112,104 @@ def test_private_pypi_requires_control_plane_configuration() -> None:
         raise AssertionError("private source without an index URL must fail")
 
 
+def test_custom_pypi_index_is_used_by_ray_runtime_env() -> None:
+    settings = Settings(database_url=SecretStr("sqlite+aiosqlite:///:memory:"))
+    template = build_runtime_env(["example==1.2.3"], 900)
+
+    materialized = materialize_runtime_env(
+        template,
+        "custom",
+        settings,
+        "http://192.168.0.11:8080/simple/",
+    )
+
+    assert materialized["pip"]["pip_install_options"] == [
+        "--disable-pip-version-check",
+        "--no-cache-dir",
+        "--index-url",
+        "http://192.168.0.11:8080/simple/",
+        "--trusted-host",
+        "192.168.0.11",
+    ]
+    assert "pip_install_options" not in template["pip"]
+
+
+def test_hook_package_is_platform_provided() -> None:
+    record = SimpleNamespace(
+        version=SimpleNamespace(
+            profile_ref="test@v1",
+            python_version="3.12",
+            resolved_dependencies={},
+        )
+    )
+
+    validate_project_compatibility(
+        record,
+        requires_python=">=3.12,<3.13",
+        dependencies=["pyscripts-hook>=0.1"],
+    )
+
+
+def test_runtime_profile_stores_custom_index_and_validates_url(tmp_path: Path) -> None:
+    app = create_app(
+        Settings(
+            database_url=SecretStr(
+                f"sqlite+aiosqlite:///{tmp_path / 'custom-index.db'}"
+            ),
+            grpc_enabled=False,
+            ray_use_label_selector=False,
+        ),
+        runtime_profile_validator=FakeRuntimeValidator(),
+    )
+    request = {
+        "name": "local-packages",
+        "python_version": "3.12",
+        "worker_pool": "default",
+        "dependencies": ["example==1.2.3"],
+        "import_checks": [],
+        "pip_source": "custom",
+    }
+
+    with TestClient(app) as client:
+        login_admin(client)
+        for invalid_url in (
+            None,
+            "ftp://packages.example.com",
+            "http://user:password@packages.example.com/simple/",
+        ):
+            response = client.post(
+                "/admin/runtime-labels",
+                json={**request, "pip_index_url": invalid_url},
+            )
+            assert response.status_code == 422
+
+        created = client.post(
+            "/admin/runtime-labels",
+            json={
+                **request,
+                "pip_index_url": "http://192.168.0.11:8080",
+            },
+        )
+        assert created.status_code == 201, created.text
+        version = created.json()
+        assert version["pip_source"] == "custom"
+        assert version["pip_index_url"] == "http://192.168.0.11:8080/simple/"
+        listed = client.get("/admin/runtime-labels").json()
+        assert listed[0]["versions"][0]["pip_index_url"] == version["pip_index_url"]
+
+        profile = app.state.profile_scheduler.register_runtime_profile(
+            environment_digest=version["environment_digest"],
+            profile_ref=version["profile_ref"],
+            worker_pool=version["worker_pool"],
+            runtime_env=build_runtime_env(request["dependencies"], 900),
+            pip_source=version["pip_source"],
+            pip_index_url=version["pip_index_url"],
+        )
+        assert profile.runtime_env["pip"]["pip_install_options"][3] == (
+            "http://192.168.0.11:8080/simple/"
+        )
+
+
 def build_artifact(
     tmp_path: Path,
     dependency: str,
@@ -114,18 +223,18 @@ def build_artifact(
         'requires-python = ">=3.12,<3.13"\n'
         f'dependencies = ["{dependency}"]\n'
         "\n[tool.pyscript]\n"
-        "spec_version = 1\n"
+        "spec_version = 2\n"
         f'runtime = "{profile_ref}"\n'
-        "\n[[tool.pyscript.endpoints]]\n"
-        'id = "run"\n'
-        'task_type = "io"\n'
-        'entrypoint = "service:run"\n'
-        'para = { params = "String" }\n'
-        'return = "String"\n'
+        'module = "service"\n'
     )
     with zipfile.ZipFile(artifact, "w") as archive:
         archive.writestr("pyproject.toml", pyproject)
-        archive.writestr("service.py", "def run(context, params): return params\n")
+        archive.writestr(
+            "service.py",
+            "from sc_hook import IOType, String, hook\n"
+            "@hook(io_types=[IOType.Rest])\n"
+            "async def run(params: String) -> String: return params\n",
+        )
     return artifact.as_uri(), hashlib.sha256(artifact.read_bytes()).hexdigest()
 
 
@@ -151,6 +260,7 @@ def test_runtime_profile_lifecycle_and_service_binding(tmp_path: Path) -> None:
     with TestClient(app) as client:
         scheduler = FakeProfileScheduler()
         app.state.profile_scheduler = scheduler
+        login_admin(client)
         worker_pools = client.get("/admin/worker-pools")
         assert worker_pools.status_code == 200
         assert worker_pools.json() == [

@@ -101,7 +101,7 @@ def test_io_promotes_warm_actor_at_target_concurrency() -> None:
 
 def test_actor_name_uses_current_wire_protocol() -> None:
     assert ProfilePoolScheduler._actor_name("test@v2", 3).startswith(
-        "pyscripts-runtime-v7-"
+        "pyscripts-runtime-v8-"
     )
 
 

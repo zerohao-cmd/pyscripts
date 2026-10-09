@@ -20,8 +20,10 @@ manager是一个常驻服务,
 manager是项目的核心组件, 其需要对接脚本层, 服务层以及ray调度层  
 需要把从git仓库拉取到的脚本, 解析为ray可以接受的任务, 以及restful api或者 grpc api.
 
-manager读取git仓库中的pyproject.toml接口定义、逻辑环境标签，以及标准
-`[project].requires-python`和`[project].dependencies`约束。
+manager读取git仓库中的pyproject.toml发布配置、逻辑环境标签，以及标准
+`[project].requires-python`和`[project].dependencies`约束。Endpoint接口由
+`pyscripts-hook`装饰器和Python类型注解定义；发布阶段在目标Runtime Env中
+导入显式配置的Hook模块并生成不可变Manifest。
 服务注册时只配置Git仓库、可选跟踪分支和跟踪策略；未指定分支时使用仓库默认分支，
 Webhook只响应目标分支的Push；运行环境属于Git revision的一部分。
 
@@ -35,21 +37,16 @@ Webhook只响应目标分支的Push；运行环境属于Git revision的一部分
 才允许构建revision；标签版本更新时先重新校验所有跟随者，再热替换运行环境。
 
 接口信息
-1. 有哪些接口入口
-2. 每个接口的定义和返回值定义
-3. 是io还是compute任务
+1. 有哪些Hook接口入口
+2. 每个接口的参数和返回值类型注解
+3. async函数自动为IO，普通函数自动为Compute
+4. IO函数可通过`await endpoint.remote_call(...)`编排内部调用
 
 ```toml
 [tool.pyscript]
-spec_version = 1
+spec_version = 2
 runtime = "polars-etl"
-
-[[tool.pyscript.endpoints]]
-id = "data_wash"
-task_type = "compute"
-entrypoint = "src.script:wash"
-para = { start_date = "Date", end_date = "Date", drop_duplicate = "Bool" }
-return = "String"
+module = "src.script"
 
 ```
 
@@ -61,7 +58,7 @@ api server从manager那里获取到最新的接口数据, 并且启动接口.  �
 详见`./data_design.md`
 
 ### gRPC动态接口
-1. 用户只在endpoint的`io_type`声明`grpc`; 平台根据`para`展平参数与`return`自动生成proto和内部descriptor.
+1. 用户只在Hook装饰器的`io_types`声明`IOType.Grpc`; 平台根据函数参数和返回类型注解自动生成proto和内部descriptor.
 2. 客户端下载proto后按自己的语言工具链生成标准强类型Stub, 不直接调用`Invoke(bytes)`信封接口.
 3. api server启动时只注册一个固定的`GenericRpcHandler`, 根据原生gRPC method path查询不可变RouteRegistry快照.
 4. Gateway不解析业务消息, 将原始protobuf bytes透传到已经固定revision的IO Actor或Compute Task.

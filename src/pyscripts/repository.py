@@ -6,13 +6,16 @@ from datetime import UTC, datetime
 from typing import Any
 
 from packaging.version import Version
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pyscripts.models import (
+    AdminCredential,
+    ApiAccessToken,
     ApiContract,
     ContractStatus,
     Endpoint,
+    EndpointInvocationPolicy,
     ExecutionKind,
     Invocation,
     InvocationExecution,
@@ -36,6 +39,7 @@ from pyscripts.schemas import (
     CreateServiceRequest,
     ResolvedRevisionRequest,
     UpdateServiceRequest,
+    UpdateEndpointInvocationPolicyRequest,
 )
 from pyscripts.runtime.profiles import (
     RuntimeProfileCompatibilityError,
@@ -50,6 +54,13 @@ class NotFoundError(LookupError):
 
 class InvalidTransitionError(RuntimeError):
     pass
+
+
+# Serializes publication of the process-wide gRPC route namespace. Service
+# row locks alone cannot prevent two different services from concurrently
+# validating and activating the same method path.
+_GRPC_ROUTE_ACTIVATION_LOCK = 0x50595343525043
+CURRENT_INTERFACE_SPEC_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +85,7 @@ class ResolvedEndpoint:
     num_gpus: float | None = None
     io_type: tuple[str, ...] = ("rest",)
     pip_source: str = "default"
+    pip_index_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +114,56 @@ class PlatformRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
+    @staticmethod
+    def _supports_current_interface(revision: Revision) -> bool:
+        manifest = revision.manifest
+        return (
+            isinstance(manifest, dict)
+            and manifest.get("spec_version") == CURRENT_INTERFACE_SPEC_VERSION
+        )
+
+    @classmethod
+    def _require_current_interface(cls, revision: Revision) -> None:
+        if cls._supports_current_interface(revision):
+            return
+        raise InvalidTransitionError(
+            "revision uses an unsupported interface specification; "
+            "publish a Hook-based spec_version=2 revision"
+        )
+
+    async def stop_services_with_unsupported_interfaces(self) -> list[str]:
+        """Disable legacy active revisions before rebuilding public routes."""
+
+        rows = await self.session.execute(
+            select(Service, Revision)
+            .join(Revision, Revision.id == Service.active_revision_id)
+            .where(
+                Service.status == ServiceStatus.ACTIVE,
+                Revision.status == RevisionStatus.ACTIVE,
+            )
+            .with_for_update()
+        )
+        stopped: list[str] = []
+        now = datetime.now(UTC)
+        for service, revision in rows:
+            if self._supports_current_interface(revision):
+                continue
+            service.status = ServiceStatus.STOPPED
+            service.updated_at = now
+            stopped.append(service.name)
+            self.session.add(
+                OutboxEvent(
+                    topic="service.stopped",
+                    aggregate_id=str(service.id),
+                    payload={
+                        "service_id": str(service.id),
+                        "reason": "unsupported_interface_specification",
+                    },
+                )
+            )
+        await self.session.flush()
+        return stopped
+
     async def create_service(
         self,
         request: CreateServiceRequest,
@@ -119,15 +181,169 @@ class PlatformRepository:
         await self.session.flush()
         return service
 
+    async def get_admin_credential(
+        self,
+        username: str = "admin",
+        *,
+        for_update: bool = False,
+    ) -> AdminCredential | None:
+        statement = select(AdminCredential).where(
+            AdminCredential.username == username
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return await self.session.scalar(statement)
+
+    async def create_admin_credential(
+        self,
+        password_hash: str,
+        username: str = "admin",
+    ) -> AdminCredential:
+        credential = AdminCredential(
+            username=username,
+            password_hash=password_hash,
+            session_version=1,
+        )
+        self.session.add(credential)
+        await self.session.flush()
+        return credential
+
+    async def update_admin_password(
+        self,
+        credential: AdminCredential,
+        password_hash: str,
+    ) -> AdminCredential:
+        credential.password_hash = password_hash
+        credential.session_version += 1
+        credential.updated_at = datetime.now(UTC)
+        await self.session.flush()
+        return credential
+
     async def list_services(self) -> list[Service]:
         result = await self.session.scalars(select(Service).order_by(Service.name))
         return list(result)
+
+    async def create_api_token(
+        self,
+        *,
+        name: str,
+        token_hash: str,
+        token_prefix: str,
+    ) -> ApiAccessToken:
+        token = ApiAccessToken(
+            name=name,
+            token_hash=token_hash,
+            token_prefix=token_prefix,
+        )
+        self.session.add(token)
+        await self.session.flush()
+        return token
+
+    async def list_api_tokens(self) -> list[ApiAccessToken]:
+        result = await self.session.scalars(
+            select(ApiAccessToken)
+            .where(ApiAccessToken.revoked_at.is_(None))
+            .order_by(ApiAccessToken.created_at.desc())
+        )
+        return list(result)
+
+    async def revoke_api_token(self, token_id: uuid.UUID) -> ApiAccessToken:
+        token = await self.session.get(ApiAccessToken, token_id)
+        if token is None:
+            raise NotFoundError("API token does not exist")
+        if token.revoked_at is None:
+            token.revoked_at = datetime.now(UTC)
+            await self.session.flush()
+        return token
+
+    async def validate_api_token(self, token_hash: str) -> bool:
+        token_id = await self.session.scalar(
+            select(ApiAccessToken.id).where(
+                ApiAccessToken.token_hash == token_hash,
+                ApiAccessToken.revoked_at.is_(None),
+            )
+        )
+        return token_id is not None
 
     async def get_service(self, service_id: uuid.UUID) -> Service:
         service = await self.session.get(Service, service_id)
         if service is None:
             raise NotFoundError("service does not exist")
         return service
+
+    async def delete_service(self, service_id: uuid.UUID) -> str:
+        service = await self.session.scalar(
+            select(Service).where(Service.id == service_id).with_for_update()
+        )
+        if service is None:
+            raise NotFoundError("service does not exist")
+        if service.status == ServiceStatus.ACTIVE:
+            raise InvalidTransitionError(
+                "active service cannot be deleted; stop it first"
+            )
+
+        active_invocations = int(
+            await self.session.scalar(
+                select(func.count())
+                .select_from(Invocation)
+                .where(
+                    Invocation.service_id == service_id,
+                    Invocation.status.in_(
+                        [InvocationStatus.ACCEPTED, InvocationStatus.RUNNING]
+                    ),
+                )
+            )
+            or 0
+        )
+        if active_invocations:
+            raise InvalidTransitionError(
+                "service still has active invocations; wait for them to finish"
+            )
+
+        invocation_ids = select(Invocation.id).where(
+            Invocation.service_id == service_id
+        )
+        revision_ids = select(Revision.id).where(Revision.service_id == service_id)
+        await self.session.execute(
+            delete(InvocationLog).where(
+                InvocationLog.invocation_id.in_(invocation_ids)
+            )
+        )
+        await self.session.execute(
+            delete(InvocationExecution).where(
+                InvocationExecution.invocation_id.in_(invocation_ids)
+            )
+        )
+        await self.session.execute(
+            delete(Invocation).where(Invocation.service_id == service_id)
+        )
+        await self.session.execute(
+            delete(RevisionContract).where(
+                RevisionContract.revision_id.in_(revision_ids)
+            )
+        )
+        await self.session.execute(
+            delete(Endpoint).where(Endpoint.revision_id.in_(revision_ids))
+        )
+        await self.session.execute(
+            delete(RevisionRuntimeProfile).where(
+                RevisionRuntimeProfile.revision_id.in_(revision_ids)
+            )
+        )
+        await self.session.execute(
+            delete(EndpointInvocationPolicy).where(
+                EndpointInvocationPolicy.service_id == service_id
+            )
+        )
+        await self.session.execute(
+            delete(Revision).where(Revision.service_id == service_id)
+        )
+        await self.session.execute(
+            delete(ApiContract).where(ApiContract.service_id == service_id)
+        )
+        await self.session.delete(service)
+        await self.session.flush()
+        return service.name
 
     async def update_service(
         self,
@@ -170,6 +386,64 @@ class PlatformRepository:
         service.updated_at = datetime.now(UTC)
         await self.session.flush()
         return service
+
+    async def endpoint_invocation_retention_counts(
+        self,
+        service_id: uuid.UUID,
+        endpoint_ids: list[str],
+    ) -> dict[str, int]:
+        if not endpoint_ids:
+            return {}
+        rows = await self.session.execute(
+            select(
+                EndpointInvocationPolicy.endpoint_id,
+                EndpointInvocationPolicy.retention_count,
+            ).where(
+                EndpointInvocationPolicy.service_id == service_id,
+                EndpointInvocationPolicy.endpoint_id.in_(endpoint_ids),
+            )
+        )
+        configured = dict(rows.all())
+        return {endpoint_id: configured.get(endpoint_id, 100) for endpoint_id in endpoint_ids}
+
+    async def update_endpoint_invocation_policy(
+        self,
+        service_id: uuid.UUID,
+        endpoint_id: str,
+        request: UpdateEndpointInvocationPolicyRequest,
+    ) -> EndpointInvocationPolicy:
+        service = await self.get_service(service_id)
+        if service.active_revision_id is None:
+            raise NotFoundError("service has no active endpoints")
+        exists = await self.session.scalar(
+            select(Endpoint.id).where(
+                Endpoint.revision_id == service.active_revision_id,
+                Endpoint.endpoint_id == endpoint_id,
+            )
+        )
+        if exists is None:
+            raise NotFoundError("active service endpoint does not exist")
+        policy = await self.session.get(
+            EndpointInvocationPolicy,
+            (service_id, endpoint_id),
+        )
+        if policy is None:
+            policy = EndpointInvocationPolicy(
+                service_id=service_id,
+                endpoint_id=endpoint_id,
+                retention_count=request.retention_count,
+            )
+            self.session.add(policy)
+        else:
+            policy.retention_count = request.retention_count
+            policy.updated_at = datetime.now(UTC)
+        await self.session.flush()
+        await self._prune_endpoint_invocations(
+            service_id,
+            endpoint_id,
+            request.retention_count,
+        )
+        return policy
 
     async def configure_service_webhook(
         self,
@@ -242,6 +516,7 @@ class PlatformRepository:
             python_version=request.python_version,
             worker_pool=request.worker_pool,
             pip_source=request.pip_source,
+            pip_index_url=request.pip_index_url,
             requested_dependencies=dependencies,
             import_checks=list(request.import_checks),
             runtime_env=runtime_env,
@@ -661,7 +936,7 @@ class PlatformRepository:
             raise NotFoundError("service does not exist")
 
         manifest = {
-            "spec_version": 1,
+            "spec_version": 2,
             "endpoints": [endpoint.to_manifest() for endpoint in request.endpoints],
         }
         if request.grpc_contract is not None:
@@ -705,7 +980,7 @@ class PlatformRepository:
                     tracking_mode=tracking_mode,
                     interface_digest=request.artifact_digest,
                     validation_result={
-                        "source": "pyproject.toml",
+                        "source": "pyscripts-hook",
                         "requested_runtime": request.runtime_profile,
                         "resolved_profile_ref": runtime_profile.version.profile_ref,
                         "requires_python": request.requires_python,
@@ -769,8 +1044,10 @@ class PlatformRepository:
             raise InvalidTransitionError(
                 f"cannot activate revision in {revision.status.value} state"
             )
+        self._require_current_interface(revision)
 
-        if any(item.get("grpc") for item in revision.manifest["endpoints"]):
+        grpc_method_paths = self._grpc_method_paths(revision)
+        if grpc_method_paths:
             contract_row = (
                 await self.session.execute(
                     select(RevisionContract, ApiContract)
@@ -783,6 +1060,12 @@ class PlatformRepository:
             _, contract = contract_row
             if contract.status != ContractStatus.READY:
                 raise InvalidTransitionError("revision contract is not ready")
+            if service.status != ServiceStatus.STOPPED:
+                await self._assert_grpc_routes_available(
+                    service,
+                    grpc_method_paths,
+                    self._grpc_service_names(revision),
+                )
         if service.active_revision_id and service.active_revision_id != revision.id:
             old_revision = await self.session.get(Revision, service.active_revision_id)
             if old_revision is not None:
@@ -847,6 +1130,14 @@ class PlatformRepository:
             raise InvalidTransitionError(
                 "service active revision is unavailable; activate a ready revision first"
             )
+        self._require_current_interface(revision)
+        grpc_method_paths = self._grpc_method_paths(revision)
+        if grpc_method_paths:
+            await self._assert_grpc_routes_available(
+                service,
+                grpc_method_paths,
+                self._grpc_service_names(revision),
+            )
         service.status = ServiceStatus.ACTIVE
         service.updated_at = datetime.now(UTC)
         self.session.add(
@@ -863,6 +1154,74 @@ class PlatformRepository:
         await self.session.flush()
         await self.session.refresh(service)
         return service
+
+    @staticmethod
+    def _grpc_method_paths(revision: Revision) -> set[str]:
+        paths: set[str] = set()
+        for endpoint in revision.manifest.get("endpoints", []):
+            grpc = endpoint.get("grpc")
+            if not isinstance(grpc, dict):
+                continue
+            service = grpc.get("service")
+            method = grpc.get("method")
+            if isinstance(service, str) and isinstance(method, str):
+                paths.add(f"/{service}/{method}")
+        return paths
+
+    @staticmethod
+    def _grpc_service_names(revision: Revision) -> set[str]:
+        services: set[str] = set()
+        for endpoint in revision.manifest.get("endpoints", []):
+            grpc = endpoint.get("grpc")
+            if not isinstance(grpc, dict):
+                continue
+            service = grpc.get("service")
+            if isinstance(service, str):
+                services.add(service)
+        return services
+
+    async def _assert_grpc_routes_available(
+        self,
+        candidate_service: Service,
+        candidate_paths: set[str],
+        candidate_grpc_services: set[str],
+    ) -> None:
+        if not candidate_paths:
+            return
+        bind = self.session.get_bind()
+        if bind.dialect.name == "postgresql":
+            await self.session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": _GRPC_ROUTE_ACTIVATION_LOCK},
+            )
+
+        rows = await self.session.execute(
+            select(Service.name, Revision)
+            .join(Revision, Revision.id == Service.active_revision_id)
+            .where(
+                Service.id != candidate_service.id,
+                Service.status == ServiceStatus.ACTIVE,
+                Revision.status == RevisionStatus.ACTIVE,
+            )
+            .order_by(Service.name)
+        )
+        for service_name, revision in rows:
+            service_conflicts = (
+                candidate_grpc_services & self._grpc_service_names(revision)
+            )
+            if service_conflicts:
+                grpc_service = min(service_conflicts)
+                raise InvalidTransitionError(
+                    f"gRPC service {grpc_service} is already published by "
+                    f"service {service_name!r}"
+                )
+            conflicts = candidate_paths & self._grpc_method_paths(revision)
+            if conflicts:
+                method_path = min(conflicts)
+                raise InvalidTransitionError(
+                    f"gRPC method {method_path} is already published by "
+                    f"service {service_name!r}"
+                )
 
     async def get_active_contract(self, service_name: str) -> ContractBundle:
         row = (
@@ -882,6 +1241,8 @@ class PlatformRepository:
         if row is None:
             raise NotFoundError("active gRPC contract does not exist")
         service, revision, contract = row
+        if not self._supports_current_interface(revision):
+            raise NotFoundError("active gRPC contract does not exist")
         return ContractBundle(service, contract, revision)
 
     async def get_latest_contract(self, service_id: uuid.UUID) -> ApiContract | None:
@@ -946,6 +1307,8 @@ class PlatformRepository:
         if row is None:
             raise NotFoundError("active service endpoint does not exist")
         service, revision, endpoint, profile = row
+        if not self._supports_current_interface(revision):
+            raise NotFoundError("active service endpoint does not exist")
         return self._resolved_endpoint(service, revision, endpoint, profile)
 
     async def list_active_endpoints(self) -> list[ResolvedEndpoint]:
@@ -971,6 +1334,7 @@ class PlatformRepository:
         return [
             self._resolved_endpoint(service, revision, endpoint, profile)
             for service, revision, endpoint, profile in rows
+            if self._supports_current_interface(revision)
         ]
 
     @staticmethod
@@ -1005,6 +1369,7 @@ class PlatformRepository:
             num_gpus=endpoint_spec.get("num_gpus"),
             io_type=tuple(endpoint_spec.get("io_type", ["rest"])),
             pip_source=profile.pip_source if profile else "default",
+            pip_index_url=profile.pip_index_url if profile else None,
         )
 
     async def begin_invocation(
@@ -1093,3 +1458,43 @@ class PlatformRepository:
                 for chunk in logs
             )
         await self.session.flush()
+        retention_count = await self.session.scalar(
+            select(EndpointInvocationPolicy.retention_count).where(
+                EndpointInvocationPolicy.service_id == invocation.service_id,
+                EndpointInvocationPolicy.endpoint_id == invocation.endpoint_id,
+            )
+        )
+        await self._prune_endpoint_invocations(
+            invocation.service_id,
+            invocation.endpoint_id,
+            retention_count or 100,
+        )
+
+    async def _prune_endpoint_invocations(
+        self,
+        service_id: uuid.UUID,
+        endpoint_id: str,
+        retention_count: int,
+    ) -> None:
+        terminal_statuses = (
+            InvocationStatus.SUCCEEDED,
+            InvocationStatus.FAILED,
+            InvocationStatus.CANCELLED,
+            InvocationStatus.TIMED_OUT,
+        )
+        stale_ids = list(
+            await self.session.scalars(
+                select(Invocation.id)
+                .where(
+                    Invocation.service_id == service_id,
+                    Invocation.endpoint_id == endpoint_id,
+                    Invocation.status.in_(terminal_statuses),
+                )
+                .order_by(Invocation.started_at.desc(), Invocation.id.desc())
+                .offset(retention_count)
+            )
+        )
+        if stale_ids:
+            await self.session.execute(
+                delete(Invocation).where(Invocation.id.in_(stale_ids))
+            )

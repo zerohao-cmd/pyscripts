@@ -12,6 +12,7 @@ dependencies = [
     "grpcio-tools>=1.74.0",
     "packaging>=25.0",
     "protobuf>=6.31.0",
+    "pyscripts-hook",
     "pydantic-settings>=2.10.0",
     "ray>=2.58.0",
     "sqlalchemy[asyncio]>=2.0.40",
@@ -40,3 +41,18 @@ packages = ["src/pyscripts"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.uv.workspace]
+members = [
+    "pyscripts_hook",
+]
+
+[tool.uv.sources]
+pyscripts-hook = { workspace = true }
+
+[[tool.uv.index]]
+name = "pypi"
+url = "http://192.168.0.11:12341/simple/"
+publish-url = "http://192.168.0.11:12341"
+allow-insecure-host = "http://192.168.0.11:12341"
+# uv publish --index pypi -u zero -p passwd

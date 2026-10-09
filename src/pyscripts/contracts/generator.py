@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -33,6 +34,7 @@ _SCALAR_TYPES = {
     "Bool": "bool",
     "String": "string",
     "Bytes": "bytes",
+    "ArrowTable": "bytes",
     "Datetime": "sint64",
     "Int": "sint32",
     "Bigint": "sint64",
@@ -106,6 +108,7 @@ def generate_contract(
     service_name: str,
     endpoints: list[EndpointSpec],
     *,
+    service_id: uuid.UUID,
     previous_descriptor: bytes | None = None,
     previous_version: str | None = None,
 ) -> GeneratedContract | None:
@@ -115,7 +118,22 @@ def generate_contract(
     if any(endpoint.grpc is not None for endpoint in grpc_endpoints):
         return None
 
-    previous_messages, previous_methods = _read_previous(previous_descriptor)
+    service_slug = re.sub(r"[^a-z0-9_]", "_", service_name.lower())
+    # The readable slug is not injective (for example, ``foo-bar`` and
+    # ``foo_bar`` normalize to the same value). The immutable service UUID
+    # makes the protobuf package globally stable and collision-free without
+    # forcing endpoint ids to be globally unique.
+    package_segment = f"{service_slug}_s{service_id.hex}"
+    service_base = _pascal(service_name)
+    service = (
+        service_base
+        if service_base.endswith("Service")
+        else f"{service_base}Service"
+    )
+
+    previous_messages, previous_methods, previous_services = _read_previous(
+        previous_descriptor
+    )
     messages: dict[str, MessageShape] = {}
     origins: dict[str, str] = {}
     methods: list[tuple[str, str, str, EndpointSpec]] = []
@@ -155,9 +173,12 @@ def generate_contract(
             _require_closed_struct(
                 response_schema, f"endpoint {endpoint.id} response_schema"
             )
-            for name, schema in sorted(
-                dict(response_schema.get("properties", {})).items()
-            ):
+            response_properties = dict(response_schema.get("properties", {}))
+            if "execution" in response_properties:
+                raise ProtoGenerationError(
+                    f"endpoint {endpoint.id} response field 'execution' is reserved"
+                )
+            for name, schema in sorted(response_properties.items()):
                 response = _message(
                     messages,
                     origins,
@@ -204,7 +225,17 @@ def generate_contract(
                 )
             )
             response_wrapped = True
+        _ensure_execution_metadata(messages, origins)
+        response.fields.append(FieldShape("execution", "PyscriptsExecution"))
         methods.append((method, request_name, response_name, endpoint))
+
+    for _, _, response_name, _ in methods:
+        previous_response = previous_messages.get(response_name)
+        if (
+            previous_response is not None
+            and "execution" not in previous_response.fields
+        ):
+            breaking = True
 
     for message in messages.values():
         if _assign_numbers(message, previous_messages.get(message.name)):
@@ -215,6 +246,15 @@ def generate_contract(
         breaking = True
 
     previous = Version(previous_version or "0")
+    if previous.major >= 1 and previous_services:
+        expected_previous_service = (
+            f"pyscripts.generated.{package_segment}.v{previous.major}.{service}"
+        )
+        if previous_services != {expected_previous_service}:
+            # Moving an existing service from the historical slug-only
+            # namespace changes every RPC path and must be visible as a major
+            # contract transition.
+            breaking = True
     if previous.major < 1:
         version = Version("1.0.0")
     elif breaking:
@@ -222,14 +262,7 @@ def generate_contract(
     else:
         version = Version(f"{previous.major}.{previous.minor + 1}.0")
 
-    package_segment = re.sub(r"[^a-z0-9_]", "_", service_name.lower())
     package = f"pyscripts.generated.{package_segment}.v{version.major}"
-    service_base = _pascal(service_name)
-    service = (
-        service_base
-        if service_base.endswith("Service")
-        else f"{service_base}Service"
-    )
     python_module_root = f"pyscripts_{package_segment}_sdk_proto"
     proto_path = (
         f"{GENERATED_PROTO_ROOT}/{python_module_root}/"
@@ -400,6 +433,49 @@ def _ensure_datetime_tz(
         )
 
 
+def _ensure_execution_metadata(
+    messages: dict[str, MessageShape],
+    origins: dict[str, str],
+) -> None:
+    log = _message(
+        messages,
+        origins,
+        "PyscriptsExecutionLog",
+        "response",
+        "platform:execution_log",
+    )
+    if not log.fields:
+        log.fields.extend(
+            [
+                FieldShape("sequence", "uint32"),
+                FieldShape("stream", "PyscriptsLogStream"),
+                FieldShape("content", "string"),
+                FieldShape("emitted_at", "string"),
+            ]
+        )
+    execution = _message(
+        messages,
+        origins,
+        "PyscriptsExecution",
+        "response",
+        "platform:execution",
+    )
+    if not execution.fields:
+        execution.fields.extend(
+            [
+                FieldShape("request_id", "string"),
+                FieldShape("service", "string"),
+                FieldShape("revision", "string"),
+                FieldShape("endpoint", "string"),
+                FieldShape("status", "PyscriptsExecutionStatus"),
+                FieldShape("error", "string"),
+                FieldShape("logs", "PyscriptsExecutionLog", repeated=True),
+                FieldShape("log_bytes", "uint64"),
+                FieldShape("logs_truncated", "bool"),
+            ]
+        )
+
+
 def _assign_numbers(
     message: MessageShape,
     previous: PreviousMessage | None,
@@ -457,9 +533,9 @@ def _assign_numbers(
 
 def _read_previous(
     payload: bytes | None,
-) -> tuple[dict[str, PreviousMessage], set[str]]:
+) -> tuple[dict[str, PreviousMessage], set[str], set[str]]:
     if not payload:
-        return {}, set()
+        return {}, set(), set()
     descriptor = descriptor_pb2.FileDescriptorSet()
     try:
         descriptor.ParseFromString(payload)
@@ -467,6 +543,7 @@ def _read_previous(
         raise ProtoGenerationError("previous descriptor is invalid") from error
     messages: dict[str, PreviousMessage] = {}
     methods: set[str] = set()
+    services: set[str] = set()
     for file_proto in descriptor.file:
         for message in file_proto.message_type:
             reserved_numbers: set[int] = set()
@@ -490,11 +567,13 @@ def _read_previous(
             )
         for service in file_proto.service:
             methods.update(method.name for method in service.method)
-    return messages, methods
+            prefix = f"{file_proto.package}." if file_proto.package else ""
+            services.add(f"{prefix}{service.name}")
+    return messages, methods, services
 
 
 def _previous_type_name(field: descriptor_pb2.FieldDescriptorProto) -> str:
-    if field.type == field.TYPE_MESSAGE:
+    if field.type in {field.TYPE_MESSAGE, field.TYPE_ENUM}:
         return field.type_name.rsplit(".", 1)[-1]
     return _PROTO_TYPE_NAMES.get(field.type, f"unsupported:{field.type}")
 
@@ -509,6 +588,18 @@ def _render_proto(
         'syntax = "proto3";',
         "",
         f"package {package};",
+        "",
+        "enum PyscriptsExecutionStatus {",
+        "  PYSCRIPTS_EXECUTION_STATUS_UNSPECIFIED = 0;",
+        "  PYSCRIPTS_EXECUTION_STATUS_SUCCEEDED = 1;",
+        "  PYSCRIPTS_EXECUTION_STATUS_FAILED = 2;",
+        "}",
+        "",
+        "enum PyscriptsLogStream {",
+        "  PYSCRIPTS_LOG_STREAM_UNSPECIFIED = 0;",
+        "  PYSCRIPTS_LOG_STREAM_STDOUT = 1;",
+        "  PYSCRIPTS_LOG_STREAM_STDERR = 2;",
+        "}",
         "",
         f"service {service} {{",
     ]

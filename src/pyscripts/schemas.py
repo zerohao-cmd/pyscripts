@@ -4,6 +4,7 @@ import re
 import uuid
 from datetime import datetime
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -108,6 +109,21 @@ class UpdateServiceRequest(BaseModel):
         return self
 
 
+class UpdateEndpointInvocationPolicyRequest(BaseModel):
+    retention_count: int = Field(ge=1, le=10_000)
+
+    model_config = {"extra": "forbid"}
+
+
+class EndpointInvocationPolicyResponse(BaseModel):
+    service_id: uuid.UUID
+    endpoint_id: str
+    retention_count: int
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class GrpcEndpointSpec(BaseModel):
     """Native unary gRPC route metadata for one script endpoint."""
 
@@ -151,7 +167,7 @@ class EndpointSpec(BaseModel):
     id: str
     task_type: Literal["io", "compute"]
     entrypoint: str
-    io_type: list[Literal["rest", "grpc"]] = Field(
+    io_type: list[Literal["rest", "grpc", "inner"]] = Field(
         default_factory=lambda: ["rest"], min_length=1
     )
     parameters: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -182,8 +198,8 @@ class EndpointSpec(BaseModel):
     @field_validator("io_type")
     @classmethod
     def unique_io_types(
-        cls, values: list[Literal["rest", "grpc"]]
-    ) -> list[Literal["rest", "grpc"]]:
+        cls, values: list[Literal["rest", "grpc", "inner"]]
+    ) -> list[Literal["rest", "grpc", "inner"]]:
         if len(values) != len(set(values)):
             raise ValueError("io_type values must be unique")
         return values
@@ -414,7 +430,44 @@ class RuntimeProfileSpecRequest(BaseModel):
     )
     dependencies: list[str] = Field(default_factory=list, max_length=256)
     import_checks: list[str] = Field(default_factory=list, max_length=128)
-    pip_source: Literal["default", "private"] = "default"
+    pip_source: Literal["default", "private", "custom"] = "default"
+    pip_index_url: str | None = Field(default=None, max_length=2048)
+
+    @model_validator(mode="after")
+    def validate_pip_index(self) -> RuntimeProfileSpecRequest:
+        if self.pip_source != "custom":
+            if self.pip_index_url is not None:
+                raise ValueError("pip_index_url requires pip_source='custom'")
+            return self
+        if not self.pip_index_url:
+            raise ValueError("custom PyPI source requires pip_index_url")
+        value = self.pip_index_url.strip()
+        if any(character.isspace() or ord(character) < 32 for character in value):
+            raise ValueError("pip_index_url must not contain whitespace")
+        try:
+            parsed = urlsplit(value)
+            hostname = parsed.hostname
+            parsed.port
+        except ValueError as error:
+            raise ValueError("pip_index_url is not a valid URL") from error
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "pip_index_url must be an HTTP(S) URL without credentials, query or fragment"
+            )
+        path = parsed.path.rstrip("/")
+        if not path.endswith("/simple"):
+            path += "/simple"
+        self.pip_index_url = urlunsplit(
+            (parsed.scheme, parsed.netloc, path + "/", "", "")
+        )
+        return self
 
     @field_validator("dependencies")
     @classmethod
@@ -474,6 +527,7 @@ class RuntimeProfileVersionResponse(BaseModel):
     python_version: str
     worker_pool: str
     pip_source: str
+    pip_index_url: str | None
     requested_dependencies: list[str]
     resolved_dependencies: dict[str, str]
     import_checks: list[str]
@@ -618,11 +672,23 @@ class InvocationLogResponse(BaseModel):
     created_at: datetime
 
 
+class ExecutionLogResponse(BaseModel):
+    sequence: int
+    stream: Literal["STDOUT", "STDERR"]
+    content: str
+    emitted_at: datetime
+
+
 class InvocationResponse(BaseModel):
     request_id: uuid.UUID
     service: str
     revision: str
+    status: Literal["SUCCEEDED", "FAILED"]
+    error: str | None = None
     result: Any
+    logs: list[ExecutionLogResponse] = Field(default_factory=list)
+    log_bytes: int = 0
+    logs_truncated: bool = False
 
 
 class ContractResponse(BaseModel):
@@ -635,3 +701,70 @@ class ContractResponse(BaseModel):
     proto_bundle_digest: str
     methods: list[str]
     proto_bundle_url: str
+
+
+class AdminLoginRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=1024)
+
+    model_config = {"extra": "forbid"}
+
+
+class AdminPasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: str = Field(min_length=12, max_length=1024)
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def password_must_change(self) -> AdminPasswordChangeRequest:
+        if self.current_password == self.new_password:
+            raise ValueError("new password must differ from current password")
+        return self
+
+
+class AdminSessionResponse(BaseModel):
+    username: str
+    expires_at: datetime
+
+
+class CreateApiTokenRequest(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not 1 <= len(normalized) <= 128:
+            raise ValueError("token name must contain 1-128 characters")
+        return normalized
+
+
+class ApiTokenResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    token_prefix: str
+    active: bool
+    created_at: datetime
+    revoked_at: datetime | None
+
+
+class CreatedApiTokenResponse(ApiTokenResponse):
+    token: str
+
+
+class PublicEndpointResponse(BaseModel):
+    id: str
+    task_type: Literal["io", "compute"]
+    io_type: list[Literal["rest", "grpc"]]
+    parameters: dict[str, dict[str, Any]]
+    response_schema: dict[str, Any]
+    rest_path: str | None = None
+    grpc_service: str | None = None
+    grpc_method: str | None = None
+
+
+class PublicServiceResponse(BaseModel):
+    name: str
+    revision: str
+    endpoints: list[PublicEndpointResponse]
+    grpc_contract_url: str | None = None

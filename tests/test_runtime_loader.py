@@ -249,3 +249,34 @@ async def test_sync_output_capture_is_bounded(tmp_path: Path) -> None:
     assert result.log_bytes == 1024
     assert result.logs_truncated is True
     assert len(result.logs) == 4
+
+
+async def test_hook_async_endpoint_is_awaited(tmp_path: Path) -> None:
+    artifact = tmp_path / "hook-io.zip"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr(
+            "service.py",
+            "import asyncio\n"
+            "from sc_hook import Int32, IOType, hook\n"
+            "@hook(io_types=[IOType.Rest])\n"
+            "async def run(value: Int32) -> Int32:\n"
+            "    await asyncio.sleep(0)\n"
+            "    return value + 1\n",
+        )
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    runtime = VersionedRuntime(tmp_path / "hook-io-cache")
+
+    result = await runtime.execute(
+        "hook-io",
+        "rev-1",
+        "run",
+        {},
+        {"value": 41},
+        artifact_uri=artifact.as_uri(),
+        artifact_digest=digest,
+        endpoints=[
+            EndpointDefinition(id="run", task_type="io", entrypoint="service:run")
+        ],
+    )
+
+    assert result == 42

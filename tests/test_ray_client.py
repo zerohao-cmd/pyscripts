@@ -26,9 +26,10 @@ def test_connect_ray_uploads_package_at_job_level(monkeypatch) -> None:
     )
 
     modules = captured["runtime_env"]["py_modules"]
-    assert len(modules) == 1
-    assert isinstance(modules[0], str)
+    assert len(modules) == 2
+    assert all(isinstance(module, str) for module in modules)
     assert modules[0].endswith("/pyscripts")
+    assert modules[1].endswith("/sc_hook")
     assert captured["runtime_env"]["config"] == {"eager_install": False}
     assert shutdown_calls == 1
 

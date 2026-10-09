@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 import grpc
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from pyscripts.api_tokens import bearer_token, hash_api_token
 from pyscripts.config import Settings
 from pyscripts.db import session_scope
 from pyscripts.grpc_gateway.registry import GrpcRoute, GrpcRouteRegistry
@@ -69,11 +70,28 @@ class GrpcInvocationDispatcher:
         context: grpc.aio.ServicerContext,
     ) -> bytes:
         target = route.target
-        async with session_scope(self._session_factory) as session:
-            invocation = await PlatformRepository(session).begin_invocation(
-                target,
-                transport="GRPC",
+        authorization = next(
+            (
+                value
+                for key, value in context.invocation_metadata()
+                if key.lower() == "authorization"
+            ),
+            None,
+        )
+        access_token = bearer_token(authorization)
+        if access_token is None:
+            await context.abort(
+                grpc.StatusCode.UNAUTHENTICATED,
+                "valid API token required",
             )
+        async with session_scope(self._session_factory) as session:
+            repository = PlatformRepository(session)
+            if not await repository.validate_api_token(hash_api_token(access_token)):
+                await context.abort(
+                    grpc.StatusCode.UNAUTHENTICATED,
+                    "valid API token required",
+                )
+            invocation = await repository.begin_invocation(target, transport="GRPC")
             request_id = invocation.id
 
         try:
@@ -114,6 +132,19 @@ class GrpcInvocationDispatcher:
                 InvocationStatus.FAILED,
                 outcome=outcome,
             )
+            if (
+                isinstance(outcome.value, bytes)
+                and target.grpc is not None
+                and target.grpc.get("generated") is True
+            ):
+                context.set_trailing_metadata(
+                    (
+                        ("pyscripts-request-id", str(request_id)),
+                        ("pyscripts-revision", target.revision),
+                        ("pyscripts-status", "FAILED"),
+                    )
+                )
+                return outcome.value
             await context.abort(grpc.StatusCode.INTERNAL, "script execution failed")
 
         if not isinstance(outcome.value, bytes):
@@ -130,6 +161,7 @@ class GrpcInvocationDispatcher:
             (
                 ("pyscripts-request-id", str(request_id)),
                 ("pyscripts-revision", target.revision),
+                ("pyscripts-status", "SUCCEEDED"),
             )
         )
         return outcome.value

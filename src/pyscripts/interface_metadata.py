@@ -1,70 +1,66 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import re
+import importlib
 import shutil
+import sys
 import tempfile
 import tomllib
 import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 
+import ray
 from pydantic import ValidationError
+from sc_hook import RemoteFunc, to_schema
 
-from pyscripts.schemas import RevisionInterfaceSpec
+from pyscripts.schemas import EndpointSpec, RevisionInterfaceSpec
+
+if TYPE_CHECKING:
+    from pyscripts.config import Settings
 
 
 class InterfaceMetadataError(RuntimeError):
     pass
 
 
-PLATFORM_TYPES = {
-    "Float",
-    "Double",
-    "Int32",
-    "Int64",
-    "Uint32",
-    "Uint64",
-    "Sint32",
-    "Sint64",
-    "Fixed32",
-    "Fixed64",
-    "Sfixed32",
-    "Sfixed64",
-    "Bool",
-    "String",
-    "Bytes",
-    "List",
-    "Struct",
-    "Date",
-    "Datetime",
-    "DatetimeTz",
-    "Int",
-    "Bigint",
-}
-SCALAR_TYPES = PLATFORM_TYPES - {"List", "Struct"}
 PYPROJECT_MAX_BYTES = 1024 * 1024
-ENDPOINT_METADATA_FIELDS = {
-    "id",
-    "task_type",
-    "entrypoint",
-    "io_type",
-    "para",
-    "return",
-}
-PYTHON_PARAMETER_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def parse_artifact_interface(
+@dataclass(frozen=True, slots=True)
+class ArtifactProjectSpec:
+    runtime_profile: str
+    modules: tuple[str, ...]
+    requires_python: str
+    dependencies: tuple[str, ...]
+
+
+class ArtifactInterfaceInspector(Protocol):
+    async def inspect(
+        self,
+        artifact_uri: str,
+        expected_digest: str,
+        project: ArtifactProjectSpec,
+        *,
+        runtime_env: Mapping[str, Any],
+        worker_pool: str,
+        pip_source: str,
+        pip_index_url: str | None,
+    ) -> RevisionInterfaceSpec: ...
+
+
+def parse_artifact_project(
     artifact_uri: str,
     expected_digest: str,
-) -> RevisionInterfaceSpec:
-    """Read and validate the interface-only metadata from an immutable ZIP."""
+) -> ArtifactProjectSpec:
+    """Read service-level publication settings without importing user code."""
 
-    with tempfile.TemporaryDirectory(prefix="pyscripts-interface-") as temp_name:
+    with tempfile.TemporaryDirectory(prefix="pyscripts-project-") as temp_name:
         archive_path = Path(temp_name) / "artifact.zip"
         _download_artifact(artifact_uri, archive_path)
         _verify_digest(archive_path, expected_digest)
@@ -72,30 +68,73 @@ def parse_artifact_interface(
     return parse_interface_document(document)
 
 
-def parse_interface_document(document: Mapping[str, Any]) -> RevisionInterfaceSpec:
+def parse_artifact_interface(
+    artifact_uri: str,
+    expected_digest: str,
+) -> RevisionInterfaceSpec:
+    """Discover Hook endpoints locally.
+
+    Production publication uses :class:`RayArtifactInterfaceInspector` so the
+    import occurs inside the selected runtime profile. This local form is used
+    for development, tests and installations which allow unregistered runtime
+    profiles.
+    """
+
+    with tempfile.TemporaryDirectory(prefix="pyscripts-interface-") as temp_name:
+        temporary = Path(temp_name)
+        archive_path = temporary / "artifact.zip"
+        source_root = temporary / "source"
+        _download_artifact(artifact_uri, archive_path)
+        _verify_digest(archive_path, expected_digest)
+        project = parse_interface_document(_read_pyproject(archive_path))
+        _extract_archive(archive_path, source_root)
+        endpoints = _discover_hook_endpoints(source_root, project.modules)
+    return _build_interface(project, endpoints)
+
+
+def parse_interface_document(document: Mapping[str, Any]) -> ArtifactProjectSpec:
+    """Parse the v2 project configuration; endpoint metadata lives in code."""
+
     tool = document.get("tool")
     if not isinstance(tool, Mapping):
         raise InterfaceMetadataError("pyproject.toml is missing [tool.pyscript]")
-    tool_metadata = tool.get("pyscript")
-    if not isinstance(tool_metadata, Mapping):
+    metadata = tool.get("pyscript")
+    if not isinstance(metadata, Mapping):
         raise InterfaceMetadataError("pyproject.toml is missing [tool.pyscript]")
 
-    unknown = set(tool_metadata) - {
-        "spec_version",
-        "runtime",
-        "endpoints",
-    }
+    unknown = set(metadata) - {"spec_version", "runtime", "module", "modules"}
     if unknown:
         fields = ", ".join(sorted(str(field) for field in unknown))
         raise InterfaceMetadataError(
             f"unsupported [tool.pyscript] field(s): {fields}"
         )
-    if tool_metadata.get("spec_version") != 1:
-        raise InterfaceMetadataError("tool.pyscript.spec_version must be 1")
+    if metadata.get("spec_version") != 2:
+        raise InterfaceMetadataError("tool.pyscript.spec_version must be 2")
 
-    runtime = tool_metadata.get("runtime")
-    if not isinstance(runtime, str):
+    runtime = metadata.get("runtime")
+    if not isinstance(runtime, str) or not runtime.strip():
         raise InterfaceMetadataError("tool.pyscript.runtime must be a string")
+
+    module = metadata.get("module")
+    modules = metadata.get("modules")
+    if module is not None and modules is not None:
+        raise InterfaceMetadataError(
+            "tool.pyscript cannot define both module and modules"
+        )
+    if module is not None:
+        modules = [module]
+    if (
+        not isinstance(modules, list)
+        or not modules
+        or not all(
+            isinstance(item, str) and _valid_module_name(item) for item in modules
+        )
+    ):
+        raise InterfaceMetadataError(
+            "tool.pyscript.module or tool.pyscript.modules must name importable modules"
+        )
+    if len(modules) != len(set(modules)):
+        raise InterfaceMetadataError("tool.pyscript.modules values must be unique")
 
     project = document.get("project")
     if not isinstance(project, Mapping):
@@ -109,129 +148,195 @@ def parse_interface_document(document: Mapping[str, Any]) -> RevisionInterfaceSp
     ):
         raise InterfaceMetadataError("project.dependencies must be an array of strings")
 
-    endpoints = tool_metadata.get("endpoints")
-    if not isinstance(endpoints, list) or not endpoints:
-        raise InterfaceMetadataError(
-            "tool.pyscript.endpoints must contain at least one endpoint"
-        )
-    normalized_endpoints: list[dict[str, Any]] = []
-    for index, endpoint in enumerate(endpoints):
-        if not isinstance(endpoint, Mapping):
-            raise InterfaceMetadataError(
-                f"tool.pyscript.endpoints[{index}] must be a table"
-            )
-        unknown_fields = set(endpoint) - ENDPOINT_METADATA_FIELDS
-        if unknown_fields:
-            raise InterfaceMetadataError(
-                f"endpoints[{index}] contains unsupported field(s): "
-                + ", ".join(sorted(str(field) for field in unknown_fields))
-            )
-        if "task_type" not in endpoint:
-            raise InterfaceMetadataError(f"endpoints[{index}].task_type is required")
-        entrypoint = endpoint.get("entrypoint")
-        if not isinstance(entrypoint, str):
-            raise InterfaceMetadataError(f"endpoints[{index}].entrypoint is required")
-        endpoint_id = endpoint.get("id")
-        if endpoint_id is None:
-            _, separator, function_name = entrypoint.partition(":")
-            if not separator or not function_name:
-                raise InterfaceMetadataError(
-                    f"endpoints[{index}].entrypoint must use "
-                    "'package.module:function'"
-                )
-            endpoint_id = function_name
+    return ArtifactProjectSpec(
+        runtime_profile=runtime,
+        modules=tuple(modules),
+        requires_python=requires_python,
+        dependencies=tuple(dependencies),
+    )
 
-        if "para" not in endpoint:
-            raise InterfaceMetadataError(f"endpoints[{index}].para is required")
-        parameters = _normalize_parameters(
-            endpoint["para"],
-            f"endpoints[{index}].para",
-        )
-        if "return" not in endpoint:
-            raise InterfaceMetadataError(f"endpoints[{index}].return is required")
-        response_schema = _compact_schema(
-            endpoint["return"],
-            f"endpoints[{index}].return",
-        )
-        normalized_endpoints.append(
-            {
-                "id": endpoint_id,
-                "task_type": endpoint["task_type"],
-                "entrypoint": entrypoint,
-                "io_type": endpoint.get("io_type", ["rest"]),
-                "parameters": parameters,
-                "response_schema": response_schema,
-            }
-        )
 
+def _valid_module_name(value: str) -> bool:
+    return bool(value) and all(part.isidentifier() for part in value.split("."))
+
+
+def _discover_hook_endpoints(
+    source_root: Path,
+    module_names: tuple[str, ...],
+) -> list[EndpointSpec]:
+    endpoints: list[EndpointSpec] = []
+    source_text = str(source_root.resolve())
+    sys.path.insert(0, source_text)
     try:
-        return RevisionInterfaceSpec.model_validate(
-            {
-                "endpoints": normalized_endpoints,
-                "runtime_profile": runtime,
-                "requires_python": requires_python,
-                "dependencies": dependencies,
-            }
+        importlib.invalidate_caches()
+        for module_name in module_names:
+            try:
+                module = importlib.import_module(module_name)
+            except Exception as error:
+                raise InterfaceMetadataError(
+                    f"failed to import Hook module {module_name!r}: "
+                    f"{type(error).__name__}: {error}"
+                ) from error
+            for attribute, value in sorted(vars(module).items()):
+                if not isinstance(value, RemoteFunc):
+                    continue
+                # Imported helpers are not automatically published. A module
+                # containing endpoints must be explicitly listed.
+                if value.func.__module__ != module.__name__:
+                    continue
+                transports = [item.value for item in value.io_types]
+                endpoints.append(
+                    EndpointSpec(
+                        id=value.endpoint_id,
+                        task_type=value.task_type.value,
+                        entrypoint=f"{module_name}:{attribute}",
+                        io_type=transports,
+                        parameters={
+                            name: to_schema(data_type)
+                            for name, data_type in value.params_type.items()
+                        },
+                        response_schema=to_schema(value.return_type),
+                        num_cpus=value.num_cpus,
+                        num_gpus=value.num_gpus,
+                    )
+                )
+    finally:
+        if sys.path and sys.path[0] == source_text:
+            sys.path.pop(0)
+        # Ray discovery tasks use max_calls=1, but local development runs in a
+        # long-lived process. Remove only modules loaded from this extraction.
+        root = source_root.resolve()
+        for name, module in tuple(sys.modules.items()):
+            module_file = getattr(module, "__file__", None)
+            if module_file is None:
+                continue
+            try:
+                belongs_to_artifact = Path(module_file).resolve().is_relative_to(root)
+            except (OSError, RuntimeError):
+                belongs_to_artifact = False
+            if belongs_to_artifact:
+                sys.modules.pop(name, None)
+
+    if not endpoints:
+        raise InterfaceMetadataError("configured Hook modules contain no endpoints")
+    ids = [endpoint.id for endpoint in endpoints]
+    duplicates = sorted({item for item in ids if ids.count(item) > 1})
+    if duplicates:
+        raise InterfaceMetadataError(
+            "Hook endpoint ids must be unique: " + ", ".join(duplicates)
+        )
+    return endpoints
+
+
+def _build_interface(
+    project: ArtifactProjectSpec,
+    endpoints: list[EndpointSpec],
+) -> RevisionInterfaceSpec:
+    try:
+        return RevisionInterfaceSpec(
+            endpoints=endpoints,
+            runtime_profile=project.runtime_profile,
+            requires_python=project.requires_python,
+            dependencies=list(project.dependencies),
         )
     except ValidationError as error:
         raise InterfaceMetadataError(
-            f"invalid tool.pyscript interface metadata: {error}"
+            f"invalid Hook interface metadata: {error}"
         ) from error
 
 
-def _normalize_parameters(value: Any, path: str) -> dict[str, dict[str, Any]]:
-    if not isinstance(value, Mapping):
-        raise InterfaceMetadataError(f"{path} must be a non-empty table")
-    if not value:
-        raise InterfaceMetadataError(f"{path} must not be empty")
-    parameters: dict[str, dict[str, Any]] = {}
-    for name, schema in value.items():
-        _validate_field_name(name, f"{path}.{name}")
-        if name == "context":
-            raise InterfaceMetadataError(f"{path}.context is reserved by the platform")
-        parameters[name] = _compact_schema(schema, f"{path}.{name}")
-    return parameters
-
-
-def _compact_schema(
-    value: Any,
-    path: str,
+@ray.remote(max_calls=1, max_retries=0)
+def _inspect_artifact_task(
+    artifact_uri: str,
+    expected_digest: str,
 ) -> dict[str, Any]:
-    if isinstance(value, str):
-        if value not in SCALAR_TYPES:
-            raise InterfaceMetadataError(
-                f"{path} must be a supported scalar pyscripts data type"
-            )
-        return {"type": value}
-    if not isinstance(value, Mapping):
-        raise InterfaceMetadataError(f"{path} must be a type string or table")
-    if not value:
-        raise InterfaceMetadataError(f"{path} must not be an empty table")
-    if "_item" in value:
-        if set(value) != {"_item"}:
-            raise InterfaceMetadataError(
-                f"{path} uses reserved _item and cannot contain other fields"
-            )
-        return {
-            "type": "List",
-            "items": _compact_schema(value["_item"], f"{path}._item"),
+    return parse_artifact_interface(artifact_uri, expected_digest).model_dump(
+        mode="json"
+    )
+
+
+class RayArtifactInterfaceInspector:
+    """Import service Hook modules in the selected immutable Runtime Env."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    async def inspect(
+        self,
+        artifact_uri: str,
+        expected_digest: str,
+        project: ArtifactProjectSpec,
+        *,
+        runtime_env: Mapping[str, Any],
+        worker_pool: str,
+        pip_source: str,
+        pip_index_url: str | None,
+    ) -> RevisionInterfaceSpec:
+        from pyscripts.ray_client import ensure_ray
+        from pyscripts.runtime.profiles import materialize_runtime_env
+
+        await ensure_ray(self.settings)
+        options: dict[str, Any] = {
+            "num_cpus": 0.01,
+            "runtime_env": materialize_runtime_env(
+                dict(runtime_env), pip_source, self.settings, pip_index_url
+            ),
         }
-    properties: dict[str, dict[str, Any]] = {}
-    for name, child in value.items():
-        _validate_field_name(name, f"{path}.{name}")
-        properties[name] = _compact_schema(child, f"{path}.{name}")
-    return {
-        "type": "Struct",
-        "required": list(properties),
-        "additionalProperties": False,
-        "properties": properties,
-    }
+        if self.settings.ray_use_label_selector:
+            options["label_selector"] = {
+                self.settings.ray_worker_pool_label_key: worker_pool
+            }
+        reference = None
+        try:
+            reference = _inspect_artifact_task.options(**options).remote(
+                artifact_uri,
+                expected_digest,
+            )
+            payload = await asyncio.wait_for(
+                reference,
+                timeout=self.settings.runtime_env_setup_timeout_seconds + 120,
+            )
+        except TimeoutError as error:
+            if reference is not None:
+                ray.cancel(reference, force=True)
+            raise InterfaceMetadataError(
+                "Hook interface discovery timed out in the selected Runtime Env"
+            ) from error
+        except Exception as error:
+            raise InterfaceMetadataError(
+                f"Hook interface discovery failed: {type(error).__name__}: {error}"
+            ) from error
+        interface = RevisionInterfaceSpec.model_validate(payload)
+        if (
+            interface.runtime_profile != project.runtime_profile
+            or interface.requires_python != project.requires_python
+            or tuple(interface.dependencies) != project.dependencies
+        ):
+            raise InterfaceMetadataError(
+                "artifact project metadata changed during Hook interface discovery"
+            )
+        return interface
 
 
-def _validate_field_name(value: Any, path: str) -> None:
-    if not isinstance(value, str) or not PYTHON_PARAMETER_NAME.fullmatch(value):
-        raise InterfaceMetadataError(
-            f"{path} is not a valid Python/protobuf field name"
+class LocalArtifactInterfaceInspector:
+    """Development/test inspector that imports Hook modules in this process."""
+
+    async def inspect(
+        self,
+        artifact_uri: str,
+        expected_digest: str,
+        project: ArtifactProjectSpec,
+        *,
+        runtime_env: Mapping[str, Any],
+        worker_pool: str,
+        pip_source: str,
+        pip_index_url: str | None,
+    ) -> RevisionInterfaceSpec:
+        del project, runtime_env, worker_pool, pip_source, pip_index_url
+        return await asyncio.to_thread(
+            parse_artifact_interface,
+            artifact_uri,
+            expected_digest,
         )
 
 
@@ -264,6 +369,33 @@ def _read_pyproject(archive_path: Path) -> dict[str, Any]:
         raise InterfaceMetadataError(f"invalid pyproject.toml: {error}") from error
 
 
+def _extract_archive(archive_path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            for member in archive.infolist():
+                target = (destination / member.filename).resolve()
+                if (
+                    target != destination.resolve()
+                    and destination.resolve() not in target.parents
+                ):
+                    raise InterfaceMetadataError(
+                        f"unsafe artifact path: {member.filename}"
+                    )
+                file_mode = member.external_attr >> 16
+                if file_mode & 0o170000 == 0o120000:
+                    raise InterfaceMetadataError(
+                        f"symbolic links are not allowed: {member.filename}"
+                    )
+            archive.extractall(destination)
+    except InterfaceMetadataError:
+        raise
+    except (OSError, zipfile.BadZipFile, RuntimeError) as error:
+        raise InterfaceMetadataError(
+            f"artifact is not a readable ZIP: {error}"
+        ) from error
+
+
 def _download_artifact(artifact_uri: str, destination: Path) -> None:
     parsed = urllib.parse.urlparse(artifact_uri)
     try:
@@ -283,9 +415,7 @@ def _download_artifact(artifact_uri: str, destination: Path) -> None:
     except InterfaceMetadataError:
         raise
     except OSError as error:
-        raise InterfaceMetadataError(
-            f"failed to download artifact: {error}"
-        ) from error
+        raise InterfaceMetadataError(f"failed to download artifact: {error}") from error
     raise InterfaceMetadataError("artifact URI must use file, http, or https")
 
 

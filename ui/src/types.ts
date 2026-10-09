@@ -47,12 +47,20 @@ export interface Endpoint {
   id: string;
   task_type: "io" | "compute";
   entrypoint: string;
-  io_type?: ("rest" | "grpc")[];
+  io_type?: ("rest" | "grpc" | "inner")[];
   response_schema?: Record<string, unknown>;
   grpc?: GrpcEndpoint | null;
   num_cpus?: number | null;
   num_gpus?: number | null;
+  log_retention_count?: number;
   [parameter: string]: unknown;
+}
+
+export interface EndpointInvocationPolicy {
+  service_id: string;
+  endpoint_id: string;
+  retention_count: number;
+  updated_at: string;
 }
 
 export interface Revision {
@@ -115,6 +123,42 @@ export interface Contract {
   proto_bundle_url: string;
 }
 
+export interface AdminSession {
+  username: string;
+  expires_at: string;
+}
+
+export interface ApiToken {
+  id: string;
+  name: string;
+  token_prefix: string;
+  active: boolean;
+  created_at: string;
+  revoked_at: string | null;
+}
+
+export interface CreatedApiToken extends ApiToken {
+  token: string;
+}
+
+export interface PublicEndpoint {
+  id: string;
+  task_type: "io" | "compute";
+  io_type: ("rest" | "grpc")[];
+  parameters: Record<string, Record<string, unknown>>;
+  response_schema: Record<string, unknown>;
+  rest_path: string | null;
+  grpc_service: string | null;
+  grpc_method: string | null;
+}
+
+export interface PublicService {
+  name: string;
+  revision: string;
+  endpoints: PublicEndpoint[];
+  grpc_contract_url: string | null;
+}
+
 export interface RuntimeProfileVersion {
   id: string;
   label_id: string;
@@ -123,7 +167,8 @@ export interface RuntimeProfileVersion {
   profile_ref: string;
   python_version: string;
   worker_pool: string;
-  pip_source: "default" | "private";
+  pip_source: "default" | "private" | "custom";
+  pip_index_url: string | null;
   requested_dependencies: string[];
   resolved_dependencies: Record<string, string>;
   import_checks: string[];
@@ -150,7 +195,8 @@ export interface RuntimeProfileInput {
   worker_pool: string;
   dependencies: string[];
   import_checks: string[];
-  pip_source: "default" | "private";
+  pip_source: "default" | "private" | "custom";
+  pip_index_url: string | null;
 }
 
 export interface WebhookConfig {

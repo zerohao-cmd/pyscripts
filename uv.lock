@@ -2,6 +2,12 @@ version = 1
 revision = 3
 requires-python = "==3.12.*"
 
+[manifest]
+members = [
+    "pyscripts",
+    "pyscripts-hook",
+]
+
 [[package]]
 name = "aiosqlite"
 version = "0.22.1"
@@ -489,6 +495,7 @@ dependencies = [
     { name = "packaging" },
     { name = "protobuf" },
     { name = "pydantic-settings" },
+    { name = "pyscripts-hook" },
     { name = "ray" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "tzdata" },
@@ -513,6 +520,7 @@ requires-dist = [
     { name = "packaging", specifier = ">=25.0" },
     { name = "protobuf", specifier = ">=6.31.0" },
     { name = "pydantic-settings", specifier = ">=2.10.0" },
+    { name = "pyscripts-hook", editable = "pyscripts_hook" },
     { name = "ray", specifier = ">=2.58.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.40" },
     { name = "tzdata", specifier = ">=2026.2" },
@@ -526,6 +534,11 @@ dev = [
     { name = "pytest", specifier = ">=8.4.0" },
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
 ]
+
+[[package]]
+name = "pyscripts-hook"
+version = "0.1.0"
+source = { editable = "pyscripts_hook" }
 
 [[package]]
 name = "pytest"

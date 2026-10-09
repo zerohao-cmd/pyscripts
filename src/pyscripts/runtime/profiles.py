@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import ray
 from packaging.markers import default_environment
@@ -55,6 +56,10 @@ def validate_project_compatibility(
         if requirement.marker and not requirement.marker.evaluate(marker_environment):
             continue
         name = canonicalize_name(requirement.name)
+        # The Hook API is shipped by the platform as a Ray job-level module,
+        # not installed separately into every user Runtime Label.
+        if name == "pyscripts-hook":
+            continue
         version = installed.get(name)
         if version is None:
             errors.append(f"{requirement.name} is not installed")
@@ -85,6 +90,7 @@ class RuntimeEnvironmentValidator(Protocol):
         dependencies: list[str],
         import_checks: list[str],
         pip_source: str,
+        pip_index_url: str | None,
     ) -> RuntimeEnvironmentValidation: ...
 
 
@@ -107,18 +113,21 @@ def materialize_runtime_env(
     runtime_env: dict[str, Any],
     pip_source: str,
     settings: Settings,
+    pip_index_url: str | None = None,
 ) -> dict[str, Any]:
     """Inject configured package-index options without persisting credentials."""
 
     result = copy.deepcopy(runtime_env)
     if pip_source == "default":
         return result
-    if pip_source != "private":
+    if pip_source not in {"private", "custom"}:
         raise RuntimeProfileValidationError(f"unknown pip source: {pip_source}")
-    if settings.private_pip_index_url is None:
+    if pip_source == "private" and settings.private_pip_index_url is None:
         raise RuntimeProfileValidationError(
             "private PyPI source is not configured on the control plane"
         )
+    if pip_source == "custom" and not pip_index_url:
+        raise RuntimeProfileValidationError("custom PyPI source has no index URL")
     pip = result.get("pip")
     if not isinstance(pip, dict):
         pip = {"packages": [], "pip_check": True}
@@ -127,21 +136,32 @@ def materialize_runtime_env(
         "--disable-pip-version-check",
         "--no-cache-dir",
         "--index-url",
-        settings.private_pip_index_url.get_secret_value(),
+        (
+            settings.private_pip_index_url.get_secret_value()
+            if pip_source == "private" and settings.private_pip_index_url is not None
+            else str(pip_index_url)
+        ),
     ]
-    for value in settings.private_pip_extra_index_urls:
-        options.extend(["--extra-index-url", value.get_secret_value()])
-    for host in settings.private_pip_trusted_hosts:
-        options.extend(["--trusted-host", host])
+    if pip_source == "private":
+        for value in settings.private_pip_extra_index_urls:
+            options.extend(["--extra-index-url", value.get_secret_value()])
+        for host in settings.private_pip_trusted_hosts:
+            options.extend(["--trusted-host", host])
+    elif pip_index_url is not None and urlsplit(pip_index_url).scheme == "http":
+        hostname = urlsplit(pip_index_url).hostname
+        if hostname:
+            options.extend(["--trusted-host", hostname])
     pip["pip_install_options"] = options
     return result
 
 
-def pip_source_fingerprint(pip_source: str, settings: Settings) -> str:
+def pip_source_fingerprint(
+    pip_source: str, settings: Settings, pip_index_url: str | None = None
+) -> str:
     if pip_source == "default":
         return "default"
     materialized = materialize_runtime_env(
-        {"pip": {"packages": []}}, pip_source, settings
+        {"pip": {"packages": []}}, pip_source, settings, pip_index_url
     )
     options = materialized["pip"]["pip_install_options"]
     return hashlib.sha256(
@@ -175,6 +195,7 @@ class RayRuntimeEnvironmentValidator:
         dependencies: list[str],
         import_checks: list[str],
         pip_source: str,
+        pip_index_url: str | None,
     ) -> RuntimeEnvironmentValidation:
         await ensure_ray(self.settings)
         runtime_env_template = build_runtime_env(
@@ -182,7 +203,7 @@ class RayRuntimeEnvironmentValidator:
             self.settings.runtime_env_setup_timeout_seconds,
         )
         runtime_env = materialize_runtime_env(
-            runtime_env_template, pip_source, self.settings
+            runtime_env_template, pip_source, self.settings, pip_index_url
         )
         options: dict[str, Any] = {
             "num_cpus": 0.01,
@@ -226,7 +247,7 @@ class RayRuntimeEnvironmentValidator:
             "runtime_env": runtime_env_template,
             "pip_source": pip_source,
             "pip_source_fingerprint": pip_source_fingerprint(
-                pip_source, self.settings
+                pip_source, self.settings, pip_index_url
             ),
             "resolved_dependencies": resolved,
         }

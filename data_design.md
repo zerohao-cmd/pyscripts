@@ -21,6 +21,6 @@
 | wrapper   | Date       | message(sint32,sint32,sint32) | String(iso格式)                          | datetime.Date     |
 | wrapper   | Datetime   | sint64                        | String(iso格式) or Number                | datetime.Datetime |
 | wrapper   | DatetimeTz | message(sint64,sint32)        | String(iso格式) or object(Number,Number) | datetime.Datetime |
-| dataframe | ArrowTable | 无(不在接口层使用)            | 无(不在接口层使用)                       | pyarrow.Table     |
+| dataframe | ArrowTable | bytes(arrow ipc字节)          | string(Base64编码)(arrow ipc字节)        | pyarrow.Table     |
 | 别名      | Int        | sint32                        | Number                                   | int               |
 | 别名      | Bigint     | sint64                        | String                                   | int               |

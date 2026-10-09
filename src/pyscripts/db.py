@@ -73,6 +73,10 @@ def _create_and_upgrade_schema(connection: Connection) -> None:
             "ALTER TABLE runtime_profile_versions "
             "ADD COLUMN pip_source VARCHAR(24) NOT NULL DEFAULT 'default'"
         )
+    if "pip_index_url" not in profile_columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE runtime_profile_versions ADD COLUMN pip_index_url TEXT"
+        )
     contract_columns = {
         column["name"] for column in inspect(connection).get_columns("api_contracts")
     }

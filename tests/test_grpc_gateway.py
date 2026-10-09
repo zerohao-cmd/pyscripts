@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 
 import grpc
+import pytest
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from pydantic import SecretStr
 
+from pyscripts.api_tokens import hash_api_token, issue_api_token
 from pyscripts.config import Settings
-from pyscripts.grpc_gateway.registry import GrpcRouteRegistry
-from pyscripts.grpc_gateway.server import GrpcGateway
-from pyscripts.repository import ResolvedEndpoint
+from pyscripts.db import (
+    create_engine,
+    create_schema,
+    create_session_factory,
+    session_scope,
+)
+from pyscripts.grpc_gateway.registry import GrpcRoute, GrpcRouteRegistry
+from pyscripts.grpc_gateway.server import GrpcGateway, GrpcInvocationDispatcher
+from pyscripts.repository import PlatformRepository, ResolvedEndpoint
+from pyscripts.runtime.output import CapturedLogChunk, ExecutionOutcome
 
 
 def _messages() -> tuple[type, type]:
@@ -100,3 +110,107 @@ async def test_generated_stub_style_call_uses_dynamic_native_method() -> None:
     finally:
         await channel.close()
         await gateway.stop()
+
+
+class GrpcAuthenticationError(RuntimeError):
+    def __init__(self, code: grpc.StatusCode, detail: str):
+        super().__init__(detail)
+        self.code = code
+
+
+class FakeGrpcContext:
+    def __init__(self, authorization: str | None):
+        self.authorization = authorization
+        self.trailing_metadata = ()
+
+    def invocation_metadata(self):
+        if self.authorization is None:
+            return ()
+        return (("authorization", self.authorization),)
+
+    async def abort(self, code, detail):
+        raise GrpcAuthenticationError(code, detail)
+
+    def set_trailing_metadata(self, metadata):
+        self.trailing_metadata = metadata
+
+
+async def test_dispatcher_requires_valid_api_token(tmp_path) -> None:
+    settings = Settings(
+        database_url=SecretStr(f"sqlite+aiosqlite:///{tmp_path / 'grpc-auth.db'}"),
+        grpc_enabled=False,
+    )
+    engine = create_engine(settings)
+    await create_schema(engine)
+    factory = create_session_factory(engine)
+
+    class Scheduler:
+        async def execute_grpc(self, target, request_id, payload):
+            return b"authorized-response"
+
+    dispatcher = GrpcInvocationDispatcher(factory, Scheduler(), 5)
+    route = GrpcRoute(
+        "/examples.echo.v1.EchoService/Echo",
+        _target("rev-auth"),
+    )
+
+    for authorization in (None, "Bearer pst_invalid"):
+        with pytest.raises(GrpcAuthenticationError) as rejected:
+            await dispatcher(route, b"request", FakeGrpcContext(authorization))
+        assert rejected.value.code == grpc.StatusCode.UNAUTHENTICATED
+
+    value, token_hash, token_prefix = issue_api_token()
+    async with session_scope(factory) as session:
+        await PlatformRepository(session).create_api_token(
+            name="grpc-test",
+            token_hash=token_hash,
+            token_prefix=token_prefix,
+        )
+
+    context = FakeGrpcContext(f"Bearer {value}")
+    response = await dispatcher(route, b"request", context)
+    assert response == b"authorized-response"
+    assert dict(context.trailing_metadata)["pyscripts-revision"] == "rev-auth"
+    assert dict(context.trailing_metadata)["pyscripts-status"] == "SUCCEEDED"
+    assert await _token_is_valid(factory, value)
+
+    class FailingScheduler:
+        async def execute_grpc(self, target, request_id, payload):
+            return ExecutionOutcome(
+                succeeded=False,
+                value=b"typed-failure-response",
+                logs=(CapturedLogChunk(0, "STDERR", "failed\n"),),
+                log_bytes=7,
+                error_type="ValueError",
+                error_message="invalid input",
+            )
+
+    generated_target = replace(
+        _target("rev-failed"),
+        grpc={
+            "service": "examples.echo.v1.EchoService",
+            "method": "Echo",
+            "descriptor_path": "descriptor.pb",
+            "generated": True,
+        },
+    )
+    failure_context = FakeGrpcContext(f"Bearer {value}")
+    failure_response = await GrpcInvocationDispatcher(
+        factory,
+        FailingScheduler(),
+        5,
+    )(
+        GrpcRoute("/examples.echo.v1.EchoService/Echo", generated_target),
+        b"request",
+        failure_context,
+    )
+    assert failure_response == b"typed-failure-response"
+    assert dict(failure_context.trailing_metadata)["pyscripts-status"] == "FAILED"
+    await engine.dispose()
+
+
+async def _token_is_valid(factory, value: str) -> bool:
+    async with factory() as session:
+        return await PlatformRepository(session).validate_api_token(
+            hash_api_token(value)
+        )

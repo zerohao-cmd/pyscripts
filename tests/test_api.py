@@ -13,6 +13,14 @@ from pyscripts.config import Settings
 from pyscripts.runtime.output import CapturedLogChunk, ExecutionOutcome
 
 
+def login_admin(client: TestClient) -> None:
+    response = client.post(
+        "/auth/login",
+        json={"password": "test-admin-password"},
+    )
+    assert response.status_code == 200, response.text
+
+
 class FakeArtifactStore:
     def __init__(self) -> None:
         self.published: list[tuple[str, str]] = []
@@ -52,18 +60,23 @@ def build_artifact(
         'version = "1.0.0"\n'
         'requires-python = ">=3.12,<3.13"\n'
         "\n[tool.pyscript]\n"
-        "spec_version = 1\n"
+        "spec_version = 2\n"
         'runtime = "py312-test"\n'
-        "\n[[tool.pyscript.endpoints]]\n"
-        'id = "run"\n'
-        f'task_type = "{task_type}"\n'
-        'entrypoint = "service:run"\n'
-        'para = { value = "Int64" }\n'
-        'return = "Int64"\n'
+        'module = "service"\n'
+    )
+    function = (
+        "async def run(value: Int64) -> Int64: return value\n"
+        if task_type == "io"
+        else "def run(value: Int64) -> Int64: return value\n"
     )
     with zipfile.ZipFile(artifact, "w") as archive:
         archive.writestr("pyproject.toml", pyproject)
-        archive.writestr("service.py", "def run(context, value): return value\n")
+        archive.writestr(
+            "service.py",
+            "from sc_hook import Int64, IOType, hook\n"
+            "@hook(io_types=[IOType.Rest])\n"
+            + function,
+        )
     return artifact, hashlib.sha256(artifact.read_bytes()).hexdigest()
 
 
@@ -87,6 +100,35 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
 
     with TestClient(app) as client:
         assert app.state.grpc_gateway.bound_port is not None
+        assert client.get("/admin/services").status_code == 401
+        login_admin(client)
+        wrong_password = client.post(
+            "/admin/password",
+            json={
+                "current_password": "wrong-password",
+                "new_password": "new-test-admin-password",
+            },
+        )
+        assert wrong_password.status_code == 400
+        changed_password = client.post(
+            "/admin/password",
+            json={
+                "current_password": "test-admin-password",
+                "new_password": "new-test-admin-password",
+            },
+        )
+        assert changed_password.status_code == 204
+        assert client.get("/admin/services").status_code == 401
+        assert client.post(
+            "/auth/login",
+            json={"password": "test-admin-password"},
+        ).status_code == 401
+        relogin = client.post(
+            "/auth/login",
+            json={"password": "new-test-admin-password"},
+        )
+        assert relogin.status_code == 200
+        assert relogin.json()["username"] == "admin"
         service_response = client.post(
             "/admin/services",
             json={
@@ -183,9 +225,21 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
         assert stopped.json()["status"] == "STOPPED"
         assert stopped.json()["active_revision_id"] == revision["id"]
 
+        token_response = client.post(
+            "/admin/api-tokens",
+            json={"name": "integration-test"},
+        )
+        assert token_response.status_code == 201
+        token_record = token_response.json()
+        access_headers = {"Authorization": f"Bearer {token_record['token']}"}
+        assert token_record["token"].startswith("pst_")
+        assert token_record["active"] is True
+        assert token_record["token"] not in client.get("/admin/api-tokens").text
+
         unavailable = client.post(
             "/v1/services/math-service/run",
             json={"value": 42},
+            headers=access_headers,
         )
         assert unavailable.status_code == 404
 
@@ -230,11 +284,29 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
                 )
 
         app.state.profile_scheduler = FakeScheduler()
-        invoked = client.post(
+        missing_token = client.post(
             "/v1/services/math-service/run",
             json={"value": 42},
         )
+        assert missing_token.status_code == 401
+        invalid_token = client.post(
+            "/v1/services/math-service/run",
+            json={"value": 42},
+            headers={"Authorization": "Bearer pst_invalid"},
+        )
+        assert invalid_token.status_code == 401
+        invoked = client.post(
+            "/v1/services/math-service/run",
+            json={"value": 42},
+            headers=access_headers,
+        )
         assert invoked.status_code == 200, invoked.text
+        assert invoked.json()["status"] == "SUCCEEDED"
+        assert invoked.json()["error"] is None
+        assert invoked.json()["result"] == 42
+        assert invoked.json()["logs"][0]["content"] == "hello from script\n"
+        assert invoked.json()["log_bytes"] == 18
+        assert invoked.json()["logs_truncated"] is False
         request_id = invoked.json()["request_id"]
         records = client.get("/admin/invocations").json()
         assert records[0]["transport"] == "REST"
@@ -245,6 +317,99 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
         assert logs.json()[0]["stream"] == "STDOUT"
         assert logs.json()[0]["content"] == "hello from script\n"
         assert logs.json()[0]["emitted_at"].endswith("Z")
+
+        policy = client.patch(
+            f"/admin/services/{service['id']}/endpoints/run/invocation-policy",
+            json={"retention_count": 1},
+        )
+        assert policy.status_code == 200, policy.text
+        assert policy.json()["retention_count"] == 1
+        detail = client.get(f"/admin/services/{service['id']}").json()
+        assert detail["endpoints"][0]["log_retention_count"] == 1
+
+        second = client.post(
+            "/v1/services/math-service/run",
+            json={"value": 43},
+            headers=access_headers,
+        )
+        assert second.status_code == 200
+        retained = client.get(
+            f"/admin/services/{service['id']}/invocations"
+        ).json()
+        assert len(retained) == 1
+        assert retained[0]["id"] == second.json()["request_id"]
+        assert client.get(f"/admin/invocations/{request_id}/logs").status_code == 404
+
+        class FailingScheduler:
+            async def execute(self, target, request_id, params):
+                return ExecutionOutcome(
+                    succeeded=False,
+                    logs=(CapturedLogChunk(0, "STDERR", "failed step\n"),),
+                    log_bytes=12,
+                    error_type="ValueError",
+                    error_message="invalid input",
+                )
+
+        app.state.profile_scheduler = FailingScheduler()
+        failed = client.post(
+            "/v1/services/math-service/run",
+            json={"value": 0},
+            headers=access_headers,
+        )
+        assert failed.status_code == 200
+        assert failed.json()["status"] == "FAILED"
+        assert failed.json()["error"] == "ValueError: invalid input"
+        assert failed.json()["result"] is None
+        assert failed.json()["logs"][0]["stream"] == "STDERR"
+        assert failed.json()["logs"][0]["content"] == "failed step\n"
+        retained = client.get(
+            f"/admin/services/{service['id']}/invocations"
+        ).json()
+        assert len(retained) == 1
+        assert retained[0]["id"] == failed.json()["request_id"]
+        revoked = client.delete(f"/admin/api-tokens/{token_record['id']}")
+        assert revoked.status_code == 200
+        assert revoked.json()["active"] is False
+        listed_tokens = client.get("/admin/api-tokens")
+        assert listed_tokens.status_code == 200
+        assert all(
+            token["id"] != token_record["id"] for token in listed_tokens.json()
+        )
+        rejected = client.post(
+            "/v1/services/math-service/run",
+            json={"value": 42},
+            headers=access_headers,
+        )
+        assert rejected.status_code == 401
+
+
+def test_delete_registered_service(tmp_path: Path) -> None:
+    app = create_app(
+        Settings(
+            database_url=SecretStr(
+                f"sqlite+aiosqlite:///{tmp_path / 'delete-service.db'}"
+            ),
+            grpc_enabled=False,
+            ray_use_label_selector=False,
+            require_registered_runtime_profiles=False,
+        )
+    )
+
+    with TestClient(app) as client:
+        login_admin(client)
+        service = client.post(
+            "/admin/services",
+            json={
+                "name": "temporary-service",
+                "git_url": "https://example.invalid/temporary.git",
+            },
+        ).json()
+
+        deleted = client.delete(f"/admin/services/{service['id']}")
+        assert deleted.status_code == 204
+        assert client.get(f"/admin/services/{service['id']}").status_code == 404
+        assert client.get("/admin/services").json() == []
+        assert client.delete(f"/admin/services/{service['id']}").status_code == 404
 
 
 def test_ui_is_served_when_distribution_exists(tmp_path: Path) -> None:
@@ -291,6 +456,7 @@ def test_webhook_token_lifecycle_and_provider_events(tmp_path: Path) -> None:
 
     with TestClient(app) as client:
         app.state.git_artifact_builder = FailingGitBuilder()
+        login_admin(client)
         service = client.post(
             "/admin/services",
             json={
@@ -386,6 +552,7 @@ def test_revision_persists_object_store_reference(tmp_path: Path) -> None:
     )
 
     with TestClient(app) as client:
+        login_admin(client)
         service = client.post(
             "/admin/services",
             json={
@@ -424,18 +591,15 @@ def test_manual_publish_builds_revision_from_git_head(tmp_path: Path) -> None:
         'requires-python = ">=3.12,<3.13"\n'
         "dependencies = []\n"
         "\n[tool.pyscript]\n"
-        "spec_version = 1\n"
+        "spec_version = 2\n"
         'runtime = "py312-test@latest"\n'
-        "\n[[tool.pyscript.endpoints]]\n"
-        'id = "run"\n'
-        'task_type = "io"\n'
-        'entrypoint = "service:run"\n'
-        'para = { value = "String" }\n'
-        'return = "String"\n'
+        'module = "service"\n'
     )
     (repository / "pyproject.toml").write_text(pyproject, encoding="utf-8")
     (repository / "service.py").write_text(
-        "def run(context, value): return value\n",
+            "from sc_hook import IOType, String, hook\n"
+            "@hook(io_types=[IOType.Rest])\n"
+            "async def run(value: String) -> String: return value\n",
         encoding="utf-8",
     )
     subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
@@ -481,6 +645,7 @@ def test_manual_publish_builds_revision_from_git_head(tmp_path: Path) -> None:
     )
 
     with TestClient(app) as client:
+        login_admin(client)
         service = client.post(
             "/admin/services",
             json={

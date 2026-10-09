@@ -1,8 +1,13 @@
 import type {
+  AdminSession,
+  ApiToken,
   Contract,
   CreateServiceInput,
+  CreatedApiToken,
   Invocation,
   InvocationLog,
+  EndpointInvocationPolicy,
+  PublicService,
   Revision,
   RuntimeLabel,
   RuntimeProfileInput,
@@ -14,6 +19,8 @@ import type {
   WorkerPool,
   WebhookConfig,
 } from "./types";
+
+let unauthorizedHandler: (() => void) | undefined;
 
 export class ApiError extends Error {
   readonly status: number;
@@ -42,12 +49,43 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Keep the HTTP status fallback when the response is not JSON.
     }
+    if (response.status === 401 && path.startsWith("/admin/")) {
+      unauthorizedHandler?.();
+    }
     throw new ApiError(response.status, message);
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
 export const api = {
+  setUnauthorizedHandler: (handler?: () => void) => {
+    unauthorizedHandler = handler;
+  },
+  login: (password: string) =>
+    request<AdminSession>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    }),
+  logout: () => request<void>("/auth/logout", { method: "POST" }),
+  changeAdminPassword: (currentPassword: string, newPassword: string) =>
+    request<void>("/admin/password", {
+      method: "POST",
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    }),
+  session: () => request<AdminSession>("/auth/session"),
+  catalog: () => request<PublicService[]>("/v1/catalog"),
+  apiTokens: () => request<ApiToken[]>("/admin/api-tokens"),
+  createApiToken: (name: string) =>
+    request<CreatedApiToken>("/admin/api-tokens", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
+  revokeApiToken: (tokenId: string) =>
+    request<ApiToken>(`/admin/api-tokens/${tokenId}`, { method: "DELETE" }),
   health: () => request<{ status: string }>("/health/ready"),
   services: () => request<Service[]>("/admin/services"),
   runtimeLabels: () => request<RuntimeLabel[]>("/admin/runtime-labels"),
@@ -84,6 +122,19 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(body),
     }),
+  deleteService: (serviceId: string) =>
+    request<void>(`/admin/services/${serviceId}`, { method: "DELETE" }),
+  updateEndpointInvocationPolicy: (
+    serviceId: string,
+    endpointId: string,
+    retentionCount: number,
+  ) => request<EndpointInvocationPolicy>(
+    `/admin/services/${serviceId}/endpoints/${encodeURIComponent(endpointId)}/invocation-policy`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ retention_count: retentionCount }),
+    },
+  ),
   serviceWebhook: (serviceId: string) =>
     request<WebhookConfig>(`/admin/services/${serviceId}/webhook`),
   rotateServiceWebhook: (serviceId: string) =>

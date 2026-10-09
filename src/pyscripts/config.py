@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -83,6 +84,13 @@ class Settings(BaseSettings):
 
     public_base_url: str | None = None
     webhook_max_body_bytes: int = Field(default=1024 * 1024, ge=1024)
+
+    admin_username: Literal["admin"] = "admin"
+    admin_password: SecretStr | None = None
+    admin_session_secret: SecretStr | None = None
+    admin_session_ttl_seconds: int = Field(default=8 * 60 * 60, ge=300)
+    admin_cookie_name: str = "pyscripts_admin_session"
+    admin_cookie_secure: bool = False
 
     object_store_enabled: bool = False
     object_store_endpoint_url: str | None = None

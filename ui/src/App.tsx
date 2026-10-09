@@ -13,8 +13,10 @@ import {
 import { ApiError, api } from "./api";
 import { Icon, type IconName } from "./icons";
 import type {
+  ApiToken,
   Contract,
   CreateServiceInput,
+  Endpoint,
   Invocation,
   InvocationLog,
   Revision,
@@ -28,13 +30,14 @@ import type {
   WorkerPool,
 } from "./types";
 
-type View = "overview" | "services" | "profiles" | "activity";
+type View = "overview" | "services" | "profiles" | "tokens" | "activity";
 type Toast = { message: string; tone: "success" | "danger" };
 
 const viewLabels: Record<View, { title: string; kicker: string }> = {
   overview: { title: "运行概览", kicker: "CONTROL PLANE" },
   services: { title: "服务与版本", kicker: "SERVICE REGISTRY" },
   profiles: { title: "运行环境", kicker: "RUNTIME PROFILES" },
+  tokens: { title: "API Token", kicker: "CALL AUTHENTICATION" },
   activity: { title: "调用记录", kicker: "INVOCATION LOG" },
 };
 
@@ -253,10 +256,23 @@ const ServiceSettingsModal: Component<{
   const [error, setError] = createSignal("");
   const [webhook, setWebhook] = createSignal<WebhookConfig | null>(null);
   const [webhookBusy, setWebhookBusy] = createSignal(false);
+  const [serviceEndpoints, setServiceEndpoints] = createSignal<Endpoint[]>([]);
+  const [retentionCounts, setRetentionCounts] = createSignal<Record<string, number>>({});
 
   onMount(() => {
     void api.serviceWebhook(props.service.id)
       .then(setWebhook)
+      .catch((caught) => setError(errorMessage(caught)));
+    void api.service(props.service.id)
+      .then((detail) => {
+        setServiceEndpoints(detail.endpoints);
+        setRetentionCounts(Object.fromEntries(
+          detail.endpoints.map((endpoint) => [
+            endpoint.id,
+            endpoint.log_retention_count ?? 100,
+          ]),
+        ));
+      })
       .catch((caught) => setError(errorMessage(caught)));
   });
 
@@ -301,7 +317,15 @@ const ServiceSettingsModal: Component<{
         check_interval_seconds:
           tracking() === "poll" ? Number(interval()) : null,
       };
-      props.onUpdated(await api.updateService(props.service.id, body));
+      await api.updateService(props.service.id, body);
+      await Promise.all(serviceEndpoints().map((endpoint) =>
+        api.updateEndpointInvocationPolicy(
+          props.service.id,
+          endpoint.id,
+          retentionCounts()[endpoint.id] ?? 100,
+        )
+      ));
+      props.onUpdated(await api.service(props.service.id));
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
@@ -342,6 +366,28 @@ const ServiceSettingsModal: Component<{
             </label>
           </Show>
         </div>
+        <Show when={serviceEndpoints().length > 0}>
+          <div class="webhook-config">
+            <strong>Endpoint 调用日志保留</strong>
+            <span>分别设置每个接口最多保留的近期已完成调用数量；正在运行的调用不会被清理。</span>
+            <For each={serviceEndpoints()}>{(endpoint) =>
+              <label class="field">
+                <span><code>{endpoint.id}</code></span>
+                <input
+                  type="number"
+                  min="1"
+                  max="10000"
+                  value={retentionCounts()[endpoint.id] ?? 100}
+                  onInput={(event) => setRetentionCounts((current) => ({
+                    ...current,
+                    [endpoint.id]: Number(event.currentTarget.value),
+                  }))}
+                />
+                <small>最多保留的调用记录数（1–10000）</small>
+              </label>
+            }</For>
+          </div>
+        </Show>
         <div class="banner">
           <strong>设置只影响后续更新</strong>
           <span>修改 Git 地址或跟踪策略不会改变当前活动 Revision；下一次同步成功后才切换代码。</span>
@@ -387,20 +433,26 @@ const RuntimeProfileModal: Component<{
   onCreated: (profile: RuntimeProfileVersion) => void;
 }> = (props) => {
   const [name, setName] = createSignal("");
-  const [pythonVersion, setPythonVersion] = createSignal("3.12");
-  const currentPool = () => props.label?.versions.find(
-    (version) => version.id === props.label?.active_version_id,
-  )?.worker_pool;
-  const [workerPool, setWorkerPool] = createSignal(
-    currentPool() ?? props.workerPools[0]?.name ?? "",
-  );
-  const [dependencies, setDependencies] = createSignal("");
-  const [imports, setImports] = createSignal("");
   const activeProfile = () => props.label?.versions.find(
     (version) => version.id === props.label?.active_version_id,
   );
+  const [pythonVersion, setPythonVersion] = createSignal(
+    activeProfile()?.python_version ?? "3.12",
+  );
+  const [workerPool, setWorkerPool] = createSignal(
+    activeProfile()?.worker_pool ?? props.workerPools[0]?.name ?? "",
+  );
+  const [dependencies, setDependencies] = createSignal(
+    activeProfile()?.requested_dependencies.join("\n") ?? "",
+  );
+  const [imports, setImports] = createSignal(
+    activeProfile()?.import_checks.join("\n") ?? "",
+  );
   const [pipSource, setPipSource] = createSignal<RuntimeProfileInput["pip_source"]>(
     activeProfile()?.pip_source ?? "default",
+  );
+  const [pipIndexUrl, setPipIndexUrl] = createSignal(
+    activeProfile()?.pip_index_url ?? "",
   );
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
@@ -418,6 +470,7 @@ const RuntimeProfileModal: Component<{
       dependencies: lines(dependencies()),
       import_checks: lines(imports()),
       pip_source: pipSource(),
+      pip_index_url: pipSource() === "custom" ? pipIndexUrl().trim() : null,
     };
     try {
       const profile = props.label
@@ -470,10 +523,18 @@ const RuntimeProfileModal: Component<{
           <span>PyPI 来源</span>
           <select value={pipSource()} onChange={(event) => setPipSource(event.currentTarget.value as RuntimeProfileInput["pip_source"])}>
             <option value="default">默认 / 官方源</option>
+            <option value="custom">自定义 PyPI server</option>
             <option value="private">平台私有源</option>
           </select>
-          <small>私有源地址和凭据由控制面环境变量配置，不会写入项目仓库或接口响应。</small>
+          <small>平台私有源使用控制面环境变量；自定义地址随环境版本保存。</small>
         </label>
+        <Show when={pipSource() === "custom"}>
+          <label class="field">
+            <span>PyPI server 地址</span>
+            <input type="url" required value={pipIndexUrl()} onInput={(event) => setPipIndexUrl(event.currentTarget.value)} placeholder="http://192.168.0.11:8080/simple/" spellcheck={false} />
+            <small>填写 Ray Worker 可访问的 HTTP(S) 地址；省略 /simple/ 时会自动补上。不要在地址中放用户名或密码。</small>
+          </label>
+        </Show>
         <label class="field">
           <span>导入校验（每行一个）</span>
           <textarea class="code-editor compact-editor" rows="4" value={imports()} onInput={(event) => setImports(event.currentTarget.value)} placeholder={"httpx\npydantic"} spellcheck={false} />
@@ -594,11 +655,67 @@ const InvocationLogModal: Component<{
   </Modal>
 );
 
-const App: Component = () => {
+const ChangePasswordModal: Component<{
+  onClose: () => void;
+  onChanged: () => void;
+}> = (props) => {
+  const [currentPassword, setCurrentPassword] = createSignal("");
+  const [newPassword, setNewPassword] = createSignal("");
+  const [confirmation, setConfirmation] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal("");
+
+  const submit: JSX.EventHandler<HTMLFormElement, SubmitEvent> = async (event) => {
+    event.preventDefault();
+    setError("");
+    if (newPassword().length < 12) {
+      setError("新密码至少需要 12 个字符。");
+      return;
+    }
+    if (newPassword() !== confirmation()) {
+      setError("两次输入的新密码不一致。");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.changeAdminPassword(currentPassword(), newPassword());
+      props.onChanged();
+    } catch (reason) {
+      setError(reason instanceof ApiError && reason.status === 400
+        ? "当前密码不正确。"
+        : errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal eyebrow="ADMIN SECURITY" title="修改管理员密码" onClose={props.onClose}>
+      <form class="form-stack" onSubmit={submit}>
+        <div class="auth-account"><span>管理员账户</span><strong>admin</strong></div>
+        <label class="field"><span>当前密码</span><input required type="password" autocomplete="current-password" value={currentPassword()} onInput={(event) => setCurrentPassword(event.currentTarget.value)} autofocus /></label>
+        <label class="field"><span>新密码</span><input required type="password" minlength="12" autocomplete="new-password" value={newPassword()} onInput={(event) => setNewPassword(event.currentTarget.value)} /><small>至少 12 个字符。修改后所有现有管理会话都会失效。</small></label>
+        <label class="field"><span>确认新密码</span><input required type="password" minlength="12" autocomplete="new-password" value={confirmation()} onInput={(event) => setConfirmation(event.currentTarget.value)} /></label>
+        <Show when={error()}><div class="form-error">{error()}</div></Show>
+        <footer class="modal__footer"><button class="button button--ghost" type="button" onClick={props.onClose}>取消</button><button class="button button--primary" type="submit" disabled={busy()}>{busy() ? "正在修改…" : "修改密码"}</button></footer>
+      </form>
+    </Modal>
+  );
+};
+
+const AdminConsole: Component<{
+  username: string;
+  onLogout: () => void;
+  onPasswordChanged: () => void;
+}> = (props) => {
   const [view, setView] = createSignal<View>("overview");
   const [services, setServices] = createSignal<Service[]>([]);
   const [runtimeLabels, setRuntimeLabels] = createSignal<RuntimeLabel[]>([]);
   const [workerPools, setWorkerPools] = createSignal<WorkerPool[]>([]);
+  const [apiTokens, setApiTokens] = createSignal<ApiToken[]>([]);
+  const [tokenName, setTokenName] = createSignal("");
+  const [createdToken, setCreatedToken] = createSignal("");
+  const [tokenBusy, setTokenBusy] = createSignal(false);
   const [selectedId, setSelectedId] = createSignal<string>("");
   const [serviceDetail, setServiceDetail] = createSignal<ServiceDetail | null>(null);
   const [revisions, setRevisions] = createSignal<Revision[]>([]);
@@ -616,6 +733,7 @@ const App: Component = () => {
   const [showPublish, setShowPublish] = createSignal(false);
   const [showServiceSettings, setShowServiceSettings] = createSignal(false);
   const [showRuntimeModal, setShowRuntimeModal] = createSignal(false);
+  const [showPasswordModal, setShowPasswordModal] = createSignal(false);
   const [runtimeModalLabel, setRuntimeModalLabel] = createSignal<RuntimeLabel | null>(null);
   const [toast, setToast] = createSignal<Toast | null>(null);
   const [selectedInvocation, setSelectedInvocation] = createSignal<Invocation | null>(null);
@@ -674,15 +792,17 @@ const App: Component = () => {
         setWorkerPoolError(errorMessage(error));
       });
     try {
-      const [nextServices, nextInvocations, nextRuntimeLabels, health] = await Promise.all([
+      const [nextServices, nextInvocations, nextRuntimeLabels, nextApiTokens, health] = await Promise.all([
         api.services(),
         api.invocations(100),
         api.runtimeLabels(),
+        api.apiTokens(),
         api.health(),
       ]);
       setServices(nextServices);
       setInvocations(nextInvocations);
       setRuntimeLabels(nextRuntimeLabels);
+      setApiTokens(nextApiTokens);
       setHealthy(health.status === "ready");
       const current = nextServices.find((item) => item.id === selectedId());
       const nextSelected = current ?? nextServices[0];
@@ -792,6 +912,31 @@ const App: Component = () => {
     }
   };
 
+  const removeService = async () => {
+    const service = selectedService();
+    if (!service) return;
+    const confirmation = window.prompt(
+      `删除服务会同时删除其 Revision、契约、调用记录和日志，且无法恢复。\n请输入服务名 ${service.name} 确认删除：`,
+    );
+    if (confirmation === null) return;
+    if (confirmation !== service.name) {
+      notify("服务名不匹配，已取消删除", "danger");
+      return;
+    }
+    try {
+      await api.deleteService(service.id);
+      setSelectedId("");
+      setServiceDetail(null);
+      setRevisions([]);
+      setServiceInvocations([]);
+      setContract(null);
+      notify(`${service.name} 已删除`);
+      await load(true);
+    } catch (error) {
+      notify(errorMessage(error), "danger");
+    }
+  };
+
   const openRuntimeModal = (label: RuntimeLabel | null = null) => {
     setRuntimeModalLabel(label);
     setShowRuntimeModal(true);
@@ -819,10 +964,39 @@ const App: Component = () => {
     }
   };
 
+  const createAccessToken = async () => {
+    const name = tokenName().trim();
+    if (!name) return;
+    setTokenBusy(true);
+    try {
+      const token = await api.createApiToken(name);
+      setApiTokens((items) => [token, ...items]);
+      setCreatedToken(token.token);
+      setTokenName("");
+      notify(`${token.name} 已创建，请立即保存 Token`);
+    } catch (error) {
+      notify(errorMessage(error), "danger");
+    } finally {
+      setTokenBusy(false);
+    }
+  };
+
+  const revokeAccessToken = async (token: ApiToken) => {
+    if (!window.confirm(`删除 ${token.name}？该 Token 会立即失效，并从列表中移除。`)) return;
+    try {
+      await api.revokeApiToken(token.id);
+      setApiTokens((items) => items.filter((item) => item.id !== token.id));
+      notify(`${token.name} 已删除`);
+    } catch (error) {
+      notify(errorMessage(error), "danger");
+    }
+  };
+
   const navItems: { id: View; label: string; icon: IconName }[] = [
     { id: "overview", label: "概览", icon: "grid" },
     { id: "services", label: "服务", icon: "server" },
     { id: "profiles", label: "运行环境", icon: "box" },
+    { id: "tokens", label: "API Token", icon: "settings" },
     { id: "activity", label: "调用记录", icon: "activity" },
   ];
 
@@ -839,7 +1013,8 @@ const App: Component = () => {
         </nav>
         <div class="sidebar__foot">
           <div class="environment"><span classList={{ "health-dot": true, "is-online": healthy() }} /><div><strong>{healthy() ? "控制面正常" : "连接异常"}</strong><span>HTTP · gRPC</span></div></div>
-          <span class="build-label">console / v0.1</span>
+          <div class="admin-identity"><div><strong>{props.username}</strong><span>管理员</span></div><div><button class="text-button" type="button" onClick={() => setShowPasswordModal(true)}>修改密码</button><button class="text-button" type="button" onClick={props.onLogout}>退出</button></div></div>
+          <a class="text-button" href="/api-docs">公开 API 文档 <Icon name="chevron" size={14} /></a>
         </div>
       </aside>
 
@@ -847,13 +1022,10 @@ const App: Component = () => {
         <header class="topbar">
           <div><span class="eyebrow">{viewLabels[view()].kicker}</span><h1>{viewLabels[view()].title}</h1></div>
           <div class="topbar__actions">
+            <a class="button button--outline" href="/api-docs">API 文档</a>
             <button class="icon-button" classList={{ "is-spinning": refreshing() }} onClick={() => void load(true)} aria-label="刷新数据" title="刷新数据"><Icon name="refresh" /></button>
-            <Show
-              when={view() === "profiles"}
-              fallback={<button class="button button--primary" onClick={() => setShowCreateService(true)}><Icon name="plus" />注册服务</button>}
-            >
-              <button class="button button--primary" onClick={() => openRuntimeModal()}><Icon name="plus" />创建环境</button>
-            </Show>
+            <Show when={view() === "profiles"}><button class="button button--primary" onClick={() => openRuntimeModal()}><Icon name="plus" />创建环境</button></Show>
+            <Show when={view() !== "profiles" && view() !== "tokens"}><button class="button button--primary" onClick={() => setShowCreateService(true)}><Icon name="plus" />注册服务</button></Show>
           </div>
         </header>
 
@@ -918,6 +1090,7 @@ const App: Component = () => {
                           <Show when={service.status === "ACTIVE"}><button class="button button--danger" onClick={() => void stop()}><Icon name="stop" />停止</button></Show>
                           <Show when={service.status === "STOPPED" && service.active_revision_id}><button class="button button--primary" onClick={() => void start()}><Icon name="start" />启动</button></Show>
                           <button class="button button--outline" onClick={() => setShowServiceSettings(true)}><Icon name="settings" />设置</button>
+                          <Show when={service.status !== "ACTIVE"}><button class="button button--danger" onClick={() => void removeService()}><Icon name="trash" />删除</button></Show>
                           <button class="button button--primary" onClick={() => setShowPublish(true)}><Icon name="rocket" />同步并发布</button>
                         </div>
                       </header>
@@ -1032,7 +1205,8 @@ const App: Component = () => {
                             </div>
                             <div class="runtime-version__pool">
                               <span>WORKER TYPE</span>
-                              <strong class="mono">{profile.worker_pool} · {profile.pip_source === "private" ? "private PyPI" : "default PyPI"}</strong>
+                              <strong class="mono">{profile.worker_pool} · {profile.pip_source === "custom" ? "自定义 PyPI" : profile.pip_source === "private" ? "平台私有源" : "官方源"}</strong>
+                              <Show when={profile.pip_index_url}><small class="mono">{profile.pip_index_url}</small></Show>
                             </div>
                             <div class="runtime-version__deps">
                               <span>{profile.requested_dependencies.length} locked deps</span>
@@ -1063,6 +1237,22 @@ const App: Component = () => {
               <InvocationTable invocations={invocations()} onSelect={(item) => void openInvocation(item)} />
             </section>
           </Show>
+
+          <Show when={view() === "tokens"}>
+            <section class="token-workspace">
+              <article class="panel token-create-panel">
+                <header class="panel__header panel__header--large"><div><span class="eyebrow">NEW CREDENTIAL</span><h2>创建调用 Token</h2><p>Token 可调用全部已上线的 REST 与 gRPC 接口，不提供细粒度权限。</p></div></header>
+                <div class="token-create-form"><label class="field"><span>名称</span><input value={tokenName()} maxlength={128} placeholder="例如：billing-production" onInput={(event) => setTokenName(event.currentTarget.value)} /></label><button class="button button--primary" disabled={tokenBusy() || !tokenName().trim()} onClick={() => void createAccessToken()}><Icon name="plus" />{tokenBusy() ? "创建中…" : "创建 Token"}</button></div>
+                <Show when={createdToken()}><div class="token-secret"><div><strong>请立即复制并安全保存</strong><span>完整 Token 只显示这一次，刷新或关闭后无法恢复。</span></div><code>{createdToken()}</code><div><button class="button button--outline button--small" onClick={() => void navigator.clipboard.writeText(createdToken())}><Icon name="copy" size={14} />复制</button><button class="text-button" onClick={() => setCreatedToken("")}>我已保存</button></div></div></Show>
+              </article>
+              <article class="panel">
+                <header class="panel__header"><div><span class="eyebrow">ACCESS TOKENS</span><h2>调用凭据</h2></div><span class="muted">{apiTokens().length} 个有效</span></header>
+                <Show when={apiTokens().length > 0} fallback={<EmptyState icon="settings" title="还没有 API Token" detail="创建 Token 后，调用者才能执行服务接口。" />}>
+                  <div class="token-list"><For each={apiTokens()}>{(token) => <article class="token-row"><div class="token-row__identity"><strong>{token.name}</strong><code>{token.token_prefix}••••••••</code></div><div><span>创建时间</span><strong>{formatDate(token.created_at)}</strong></div><div><span>状态</span><StatusBadge value="ACTIVE" /></div><button class="button button--danger button--small" onClick={() => void revokeAccessToken(token)}>删除</button></article>}</For></div>
+                </Show>
+              </article>
+            </section>
+          </Show>
         </Show>
       </main>
 
@@ -1071,9 +1261,10 @@ const App: Component = () => {
       <Show when={showPublish() && selectedService()} keyed>{(service) => <PublishRevisionModal service={service} onClose={() => setShowPublish(false)} onPublished={() => { setShowPublish(false); notify(service.status === "STOPPED" ? "Git revision 已发布，服务仍保持停止" : "Git revision 已构建并上线"); void load(true); }} />}</Show>
       <Show when={showRuntimeModal()}><RuntimeProfileModal label={runtimeModalLabel()} workerPools={workerPools()} onClose={() => setShowRuntimeModal(false)} onCreated={(profile) => { setShowRuntimeModal(false); notify(profile.status === "FAILED" ? `${profile.profile_ref} 校验失败` : `${profile.profile_ref} 已通过校验`, profile.status === "FAILED" ? "danger" : "success"); void load(true); }} /></Show>
       <Show when={selectedInvocation()} keyed>{(invocation) => <InvocationLogModal invocation={invocation} logs={invocationLogs()} loading={invocationLogsLoading()} error={invocationLogsError()} onClose={() => setSelectedInvocation(null)} />}</Show>
+      <Show when={showPasswordModal()}><ChangePasswordModal onClose={() => setShowPasswordModal(false)} onChanged={props.onPasswordChanged} /></Show>
       <Show when={toast()} keyed>{(item) => <div class={`toast toast--${item.tone}`}><Icon name={item.tone === "success" ? "check" : "x"} /><span>{item.message}</span></div>}</Show>
     </div>
   );
 };
 
-export default App;
+export default AdminConsole;

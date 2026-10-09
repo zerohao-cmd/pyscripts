@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 import ray
+import sc_hook
 
 import pyscripts
 from pyscripts.config import Settings
@@ -18,6 +19,15 @@ def pyscripts_module_path() -> str:
     module_file = pyscripts.__file__
     if module_file is None:
         raise RuntimeError("cannot locate the pyscripts package")
+    return str(Path(module_file).resolve().parent)
+
+
+def hook_module_path() -> str:
+    """Return the Hook package uploaded alongside the worker runtime."""
+
+    module_file = sc_hook.__file__
+    if module_file is None:
+        raise RuntimeError("cannot locate the sc_hook package")
     return str(Path(module_file).resolve().parent)
 
 
@@ -42,7 +52,7 @@ def connect_ray(settings: Settings) -> None:
             namespace=settings.ray_namespace,
             ignore_reinit_error=True,
             runtime_env={
-                "py_modules": [pyscripts_module_path()],
+                "py_modules": [pyscripts_module_path(), hook_module_path()],
                 # A Ray Client job can remain in GCS after it has completed.
                 # Eager installation would make every newly autoscaled worker
                 # download the control package for all of those historical

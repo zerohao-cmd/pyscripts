@@ -43,6 +43,58 @@ uv run pyscripts-db --init
 uv run uvicorn pyscripts.api:app --reload
 ```
 
+### Docker Compose
+
+The Compose deployment runs the control plane, HTTP API, gRPC gateway, and
+prebuilt Web console in one container. PostgreSQL, the Ray cluster, and S3
+object storage remain external services; create the database and object-storage
+bucket first. On first startup the application creates its database tables.
+
+Copy `.env.example` to `.env`, replace every placeholder credential, and set
+`PYSCRIPTS_DATABASE_HOST`, `PYSCRIPTS_RAY_ADDRESS`, and
+`PYSCRIPTS_OBJECT_STORE_ENDPOINT_URL` to addresses reachable **from the
+container**. A Kubernetes-only `*.svc.cluster.local` Ray address will not work
+from Docker outside that cluster. Ray workers must also be able to reach the
+object-store endpoint embedded in presigned artifact URLs. For services on the
+Docker host, `host.docker.internal` is available in the container. Outside
+Kubernetes, worker-pool discovery sees only Ray nodes that are currently up;
+if you need to select a pool that has scaled to zero, run the control plane
+inside Kubernetes with RayCluster read access instead.
+
+```bash
+docker compose config --quiet
+docker compose up -d --build
+docker compose ps
+```
+
+The console and HTTP API listen at `http://127.0.0.1:8000`, and gRPC (when
+enabled) at `127.0.0.1:50051`. Set `PYSCRIPTS_HTTP_BIND`, `PYSCRIPTS_HTTP_PORT`,
+`PYSCRIPTS_GRPC_BIND`, or `PYSCRIPTS_GRPC_HOST_PORT` in `.env` to change the
+published host addresses/ports. The container always listens internally on
+8000 and 50051. Keep the default loopback binding unless a TLS reverse proxy
+or a trusted private network protects these endpoints; Ray Client itself must
+also remain on a trusted network.
+
+```bash
+docker compose logs -f pyscripts
+docker compose down
+```
+
+`down` leaves the named contract-cache volume intact. Rebuild the image to
+deploy new control-plane or UI code. Run only one Uvicorn worker per container
+because that process owns the gRPC listener.
+
+For private SSH Git repositories, set `PYSCRIPTS_GIT_SSH_DIR` in `.env` to an
+absolute path containing a dedicated deploy key and a pinned `known_hosts`
+file. The directory and key must be readable by container UID 10001. Then use
+the optional read-only mount:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.ssh.yml up -d --build
+```
+
+Do not place SSH keys in the image or the Git repository.
+
 ### Web console
 
 The console uses Bun, SolidJS, and local CSS only. For frontend development,
@@ -75,6 +127,47 @@ immutable route snapshot. Horizontal scaling should happen at the pod level.
 Run `uv run pyscripts-db` without `--init` for a read-only connectivity and
 table check.
 
+### Administrator account
+
+The management console has exactly one fixed account named `admin`; the login
+form only asks for its password. `PYSCRIPTS_ADMIN_PASSWORD` bootstraps the
+credential only when the database does not contain an administrator record.
+After initialization, the Web console's password-change action stores a salted
+scrypt hash in PostgreSQL, and the environment password no longer overrides it.
+Changing the password increments the credential session version and immediately
+invalidates every existing administrator cookie. Keep
+`PYSCRIPTS_ADMIN_SESSION_SECRET` stable and provide at least 32 random characters.
+
+### API access tokens
+
+Business REST and gRPC invocations require a platform API Token. Administrators
+create and revoke tokens from the Web console. A token grants access to every
+active service and endpoint; there are no per-service permissions. Only the
+token prefix and SHA-256 digest are stored, and the complete token is shown
+once when it is created.
+
+REST clients send the token as a Bearer credential:
+
+```bash
+curl -X POST 'http://localhost:8000/v1/services/example/add' \
+  -H 'Authorization: Bearer pst_...' \
+  -H 'Content-Type: application/json' \
+  --data '{"x": 1, "y": 2}'
+```
+
+gRPC clients use the same value as call metadata:
+
+```python
+response = stub.Add(
+    AddRequest(x=1, y=2),
+    metadata=(("authorization", "Bearer pst_..."),),
+)
+```
+
+Health checks, the public API reference, catalog, and Proto downloads remain
+public. Management APIs continue to require the separate administrator session.
+Always transport API Tokens over HTTPS/TLS outside a trusted development network.
+
 The application creates its initial schema during startup. This is intended
 only for the first implementation slice; versioned migrations should replace
 `create_all` before production.
@@ -82,27 +175,26 @@ only for the first implementation slice; versioned migrations should replace
 ## Artifact contract
 
 业务脚本从目录组织、打包、注册、发布、激活到调用的完整接入方式，以及如何在
-`pyproject.toml` 中声明 HTTP、Compute/IO 和 gRPC 接口，见
+Hook 装饰器中声明 HTTP、Compute/IO、内部调用和 gRPC 接口，见
 [`pyproject_interface.md`](./pyproject_interface.md)。
 
-An artifact is a ZIP file containing importable Python modules. Entrypoints use
-`package.module:function`. Relative imports are preferred, and artifact-local
+An artifact is a ZIP file containing importable Python modules. `[tool.pyscript]`
+selects one `module` or a list of `modules`; decorated functions become
+`package.module:function` entrypoints. Relative imports are preferred, and artifact-local
 absolute imports such as `from src.helpers import value` are translated into
 the revision's private module namespace so concurrent revisions remain isolated.
 
 HTTP request object keys are passed as flat keyword arguments:
 
 ```python
-def add(x: int, y: int) -> int:
+@hook(io_types=[IOType.Rest])
+def add(x: Int64, y: Int64) -> Int64:
     return x + y
 ```
 
-For backward compatibility, a handler that explicitly names its first argument
-`context` receives the platform invocation context before its business
-arguments.
-
-`pyproject.toml` defines the interface, a logical Runtime Label reference,
-and the project's Python/dependency constraints. Service registration stores
+`pyproject.toml` defines the Hook module list, a logical Runtime Label reference,
+and the project's Python/dependency constraints. Hook modules define the
+interface through decorators and type annotations. Service registration stores
 the Git repository, an optional tracked branch, and the tracking policy. An
 unset branch follows the repository's default branch; a configured branch is
 cloned explicitly with single-branch history. For every new commit, the manager
@@ -181,9 +273,16 @@ already submitted Compute Tasks drain on the previous execution snapshot.
 Explicit `data-default@v2` references remain available for exceptional pinned
 rollbacks and do not follow later activations.
 
-Each runtime-label version also selects a package source: `default` uses pip's
-normal configuration, while `private` uses the platform-managed private index.
-Configure it only on the control plane (or through a Kubernetes Secret):
+Each runtime-label version also selects a package source. In the Web console,
+choose **Default / official** or **Custom PyPI server** and enter a URL reachable
+from every Ray worker, for example `http://192.168.0.11:8080/simple/`. The URL
+is stored on the immutable environment version, and the control plane applies
+it during temporary validation, interface discovery, and execution. For plain
+HTTP URLs, the host is added to pip's trusted hosts. Index URLs entered in the
+Web console cannot contain credentials.
+
+The existing `private` choice uses the platform-managed private index. Configure
+it on the control plane (or through a Kubernetes Secret):
 
 ```dotenv
 PYSCRIPTS_PRIVATE_PIP_INDEX_URL=https://user:token@pypi.example.com/simple
@@ -191,11 +290,10 @@ PYSCRIPTS_PRIVATE_PIP_EXTRA_INDEX_URLS=["https://mirror.example.com/simple"]
 PYSCRIPTS_PRIVATE_PIP_TRUSTED_HOSTS=[]
 ```
 
-The database stores only the `default`/`private` choice and the environment
-digest. Index URLs and credentials are injected into Ray Runtime Env only when
-validating or starting work and are omitted from API responses and persisted
-runtime templates. Prefer TLS; `trusted-host` disables certificate checks for
-the named host and should be limited to controlled development networks.
+For `private`, the database stores only the choice and environment digest;
+credentials are injected into Ray Runtime Env only when validating or starting
+work. Custom index URLs are stored and displayed in the Web console. Prefer TLS
+outside controlled development networks.
 
 ## Git webhooks
 
@@ -297,26 +395,23 @@ descriptors, and contract versions are generated by the platform:
 
 ```toml
 [tool.pyscript]
-spec_version = 1
+spec_version = 2
 runtime = "default"
-
-[[tool.pyscript.endpoints]]
-id = "add"
-task_type = "compute"
-entrypoint = "service:add"
-io_type = ["rest", "grpc"]
-para = { x = "Int64", y = "Int64" }
-return = "Int64"
+module = "service"
 ```
 
 The same flattened Python function handles both transports:
 
 ```python
-def add(x: int, y: int) -> int:
+from sc_hook import Int64, IOType, hook
+
+@hook(io_types=[IOType.Rest, IOType.Grpc])
+def add(x: Int64, y: Int64) -> Int64:
     return x + y
 ```
 
-`io_type` accepts `rest` and `grpc`; omitting it defaults to `["rest"]`.
+The decorator accepts `IOType.Rest`, `IOType.Grpc`, and internal-only
+`IOType.Inner` transports.
 REST wraps the flattened parameters in a JSON object, while generated gRPC maps
 the request message fields directly back to keyword arguments. Clients use the
 downloaded Proto to generate the ordinary service Stub and protobuf messages
@@ -390,6 +485,10 @@ Execution is split by endpoint type:
   cannot carry state into the next request. Dependencies remain in the immutable
   Runtime Env.
 - Cancelling or timing out a Compute invocation cancels its Ray ObjectRef.
+- Hook IO endpoints may `await target.remote_call(...)`. Calls remain pinned to
+  the current Revision: Compute targets become nested Ray Tasks, while IO
+  targets stay asynchronous inside the current Actor. Outside Ray the same
+  code runs locally for normal script development.
 
 Every invocation records its execution kind, artifact digest, runtime-profile
 version, and environment digest. A retiring environment waits for both Actor
@@ -399,23 +498,26 @@ Python `sys.stdout` and `sys.stderr` output is isolated per invocation and
 stored when execution finishes. The first implementation is intentionally
 non-streaming: the HTTP/gRPC result and captured log chunks return from Ray as
 one outcome, then the control plane commits the invocation status and logs in
-the same transaction. Every chunk carries the UTC timestamp captured on the
+the same transaction. REST returns status and logs in its invocation envelope;
+generated gRPC responses expose the same data through the strongly typed
+`execution` field. This response envelope is mandatory for generated contracts;
+upgrading a legacy generated response without `execution` is a breaking contract
+change and requires publishing a new revision. Every chunk carries the UTC timestamp captured on the
 Worker when that output was emitted; the Web console displays it in the
 browser's local time with millisecond precision. Read logs with
 `GET /admin/invocations/{invocation_id}/logs` or by clicking an invocation in
-the Web console. `PYSCRIPTS_INVOCATION_LOG_MAX_BYTES` bounds retained output,
+the Web console. Each service endpoint has an independently configurable
+recent-invocation retention count; reducing it prunes the oldest completed
+invocations without touching running work. `PYSCRIPTS_INVOCATION_LOG_MAX_BYTES`
+bounds output captured for one invocation,
 `PYSCRIPTS_INVOCATION_LOG_CHUNK_BYTES` controls database chunk size, and
 `PYSCRIPTS_CAPTURE_STDERR` enables stderr capture. Native file-descriptor
 writes and child-process output are outside this first version.
 
-Compute endpoints may override the default task resources in their manifest:
+Compute endpoints may override the default task resources in their decorator:
 
-```json
-{
-  "id": "forecast",
-  "task_type": "compute",
-  "entrypoint": "service:forecast",
-  "num_cpus": 2,
-  "num_gpus": 0
-}
+```python
+@hook(io_types=[IOType.Inner], num_cpus=2, num_gpus=0)
+def forecast(data: list[Float]) -> Float:
+    ...
 ```

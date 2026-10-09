@@ -97,9 +97,13 @@ def generated_response_value(
     schema: Mapping[str, Any],
     *,
     wrapped: bool,
+    execution: Mapping[str, Any] | None = None,
 ) -> Any:
     converted = _python_value(value, schema)
-    return {"result": converted} if wrapped else converted
+    response = {"result": converted} if wrapped else dict(converted)
+    if execution is not None:
+        response["execution"] = dict(execution)
+    return response
 
 
 def _message_value(value: Any, schema: Mapping[str, Any]) -> Any:
@@ -125,6 +129,15 @@ def _message_value(value: Any, schema: Mapping[str, Any]) -> Any:
         import datetime
 
         return datetime.datetime.fromtimestamp(value / 1000)
+    if schema_type == "ArrowTable":
+        pyarrow = _pyarrow()
+        try:
+            with pyarrow.ipc.open_stream(pyarrow.BufferReader(bytes(value))) as reader:
+                return reader.read_all()
+        except Exception as error:
+            raise ProtobufContractError(
+                "ArrowTable payload is not a valid Arrow IPC stream"
+            ) from error
     if schema_type == "Bytes":
         return bytes(value)
     return value
@@ -157,11 +170,33 @@ def _python_value(value: Any, schema: Mapping[str, Any]) -> Any:
             "timestamp": timestamp,
             "offset_minutes": int(offset.total_seconds() // 60),
         }
+    if schema_type == "ArrowTable":
+        import base64
+
+        pyarrow = _pyarrow()
+        if not isinstance(value, pyarrow.Table):
+            raise ProtobufContractError(
+                "ArrowTable handler value must be a pyarrow.Table"
+            )
+        sink = pyarrow.BufferOutputStream()
+        with pyarrow.ipc.new_stream(sink, value.schema) as writer:
+            writer.write_table(value)
+        return base64.b64encode(sink.getvalue().to_pybytes()).decode("ascii")
     if schema_type == "Bytes":
         import base64
 
         return base64.b64encode(bytes(value)).decode("ascii")
     return value
+
+
+def _pyarrow() -> Any:
+    try:
+        import pyarrow
+    except ImportError as error:
+        raise ProtobufContractError(
+            "ArrowTable requires pyarrow in the selected runtime profile"
+        ) from error
+    return pyarrow
 
 
 def load_grpc_codecs(

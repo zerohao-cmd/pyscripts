@@ -11,17 +11,19 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from pyscripts.api_tokens import bearer_token, hash_api_token, issue_api_token
+from pyscripts.auth import AdminAuth, hash_admin_password, verify_admin_password
 from pyscripts.config import Settings, get_settings
 from pyscripts.contracts import ProtoContractPublisher
 from pyscripts.contracts.builder import ContractBuildError
@@ -38,8 +40,13 @@ from pyscripts.grpc_gateway.server import (
     refresh_routes_forever,
 )
 from pyscripts.interface_metadata import (
+    ArtifactInterfaceInspector,
+    ArtifactProjectSpec,
     InterfaceMetadataError,
+    LocalArtifactInterfaceInspector,
+    RayArtifactInterfaceInspector,
     parse_artifact_interface,
+    parse_artifact_project,
 )
 from pyscripts.git_source import GitArtifactBuilder, GitSourceError
 from pyscripts.models import InvocationStatus, RuntimeProfileStatus, ServiceStatus
@@ -60,16 +67,26 @@ from pyscripts.runtime.profiles import (
 )
 from pyscripts.schemas import (
     ActorPoolStatusResponse,
+    AdminLoginRequest,
+    AdminPasswordChangeRequest,
+    AdminSessionResponse,
+    ApiTokenResponse,
     ContractResponse,
+    CreatedApiTokenResponse,
+    CreateApiTokenRequest,
     CreateRevisionRequest,
     CreateRuntimeLabelRequest,
     CreateRuntimeProfileVersionRequest,
     CreateServiceRequest,
+    EndpointInvocationPolicyResponse,
     EndpointSpec,
+    ExecutionLogResponse,
     GrpcContractSpec,
     InvocationListItemResponse,
     InvocationLogResponse,
     InvocationResponse,
+    PublicEndpointResponse,
+    PublicServiceResponse,
     RevisionDetailResponse,
     RevisionInterfaceSpec,
     RevisionResponse,
@@ -79,6 +96,7 @@ from pyscripts.schemas import (
     ServiceDetailResponse,
     ServiceResponse,
     UpdateServiceRequest,
+    UpdateEndpointInvocationPolicyRequest,
     WorkerPoolResponse,
     WebhookConfigResponse,
 )
@@ -109,6 +127,7 @@ def create_app(
     runtime_profile_validator: RuntimeEnvironmentValidator | None = None,
     worker_pool_catalog: WorkerPoolCatalog | None = None,
     artifact_store: ArtifactStore | None = None,
+    interface_inspector: ArtifactInterfaceInspector | None = None,
 ) -> FastAPI:
     app_settings = settings or get_settings()
 
@@ -119,6 +138,22 @@ def create_app(
             await create_schema(engine)
         app.state.engine = engine
         app.state.session_factory = create_session_factory(engine)
+        admin_auth: AdminAuth = app.state.admin_auth
+        async with session_scope(app.state.session_factory) as session:
+            repository = PlatformRepository(session)
+            credential = await repository.get_admin_credential()
+            if credential is None and admin_auth.bootstrap_password is not None:
+                await repository.create_admin_credential(
+                    hash_admin_password(admin_auth.bootstrap_password)
+                )
+            stopped_services = (
+                await repository.stop_services_with_unsupported_interfaces()
+            )
+            if stopped_services:
+                logger.warning(
+                    "stopped services with unsupported interface specifications: %s",
+                    ", ".join(stopped_services),
+                )
         app.state.artifact_store = artifact_store or create_artifact_store(
             app_settings
         )
@@ -131,6 +166,11 @@ def create_app(
         app.state.profile_scheduler = profile_scheduler
         app.state.runtime_profile_validator = (
             runtime_profile_validator or RayRuntimeEnvironmentValidator(app_settings)
+        )
+        app.state.interface_inspector = interface_inspector or (
+            LocalArtifactInterfaceInspector()
+            if runtime_profile_validator is not None
+            else RayArtifactInterfaceInspector(app_settings)
         )
         app.state.worker_pool_catalog = (
             worker_pool_catalog or create_worker_pool_catalog(app_settings)
@@ -185,6 +225,172 @@ def create_app(
 
     app = FastAPI(title="pyscripts", version="0.1.0", lifespan=lifespan)
     app.state.settings = app_settings
+    app.state.admin_auth = AdminAuth(app_settings)
+
+    @app.middleware("http")
+    async def require_admin_session(request: Request, call_next: Any) -> Any:
+        if request.url.path.startswith("/admin/"):
+            auth: AdminAuth = request.app.state.admin_auth
+            if not auth.configured:
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={
+                        "detail": "administrator authentication is not configured"
+                    },
+                )
+            admin_session = auth.verify_session(
+                request.cookies.get(auth.cookie_name)
+            )
+            if admin_session is None:
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": "administrator login required"},
+                )
+            async with request.app.state.session_factory() as database_session:
+                credential = await PlatformRepository(
+                    database_session
+                ).get_admin_credential(admin_session.username)
+            if credential is None:
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={"detail": "administrator authentication is not configured"},
+                )
+            if credential.session_version != admin_session.credential_version:
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": "administrator login required"},
+                )
+            request.state.admin = admin_session
+        return await call_next(request)
+
+    @app.post("/auth/login", response_model=AdminSessionResponse)
+    async def login(
+        request: Request,
+        credentials: AdminLoginRequest,
+        session: SessionDependency,
+    ) -> JSONResponse:
+        auth: AdminAuth = request.app.state.admin_auth
+        if not auth.configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="administrator authentication is not configured",
+            )
+        credential = await PlatformRepository(session).get_admin_credential()
+        if credential is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="administrator authentication is not configured",
+            )
+        if not verify_admin_password(
+            credentials.password,
+            credential.password_hash,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid administrator credentials",
+            )
+        token = auth.issue_session(credential.session_version)
+        admin_session = auth.verify_session(token)
+        assert admin_session is not None
+        response = JSONResponse(
+            AdminSessionResponse(
+                username=admin_session.username,
+                expires_at=datetime.fromtimestamp(admin_session.expires_at, UTC),
+            ).model_dump(mode="json")
+        )
+        response.set_cookie(
+            auth.cookie_name,
+            token,
+            max_age=auth.ttl_seconds,
+            httponly=True,
+            secure=auth.cookie_secure,
+            samesite="strict",
+            path="/",
+        )
+        return response
+
+    @app.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+    async def logout(request: Request) -> Response:
+        response = Response(status_code=status.HTTP_204_NO_CONTENT)
+        auth: AdminAuth = request.app.state.admin_auth
+        response.delete_cookie(
+            auth.cookie_name,
+            httponly=True,
+            secure=auth.cookie_secure,
+            samesite="strict",
+            path="/",
+        )
+        return response
+
+    @app.get("/auth/session", response_model=AdminSessionResponse)
+    async def get_admin_session(
+        request: Request,
+        session: SessionDependency,
+    ) -> AdminSessionResponse:
+        auth: AdminAuth = request.app.state.admin_auth
+        if not auth.configured:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="administrator authentication is not configured",
+            )
+        admin_session = auth.verify_session(request.cookies.get(auth.cookie_name))
+        if admin_session is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="administrator login required",
+            )
+        credential = await PlatformRepository(session).get_admin_credential(
+            admin_session.username
+        )
+        if (
+            credential is None
+            or credential.session_version != admin_session.credential_version
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="administrator login required",
+            )
+        return AdminSessionResponse(
+            username=admin_session.username,
+            expires_at=datetime.fromtimestamp(admin_session.expires_at, UTC),
+        )
+
+    @app.post("/admin/password", status_code=status.HTTP_204_NO_CONTENT)
+    async def change_admin_password(
+        request: Request,
+        body: AdminPasswordChangeRequest,
+        session: SessionDependency,
+    ) -> Response:
+        async with session.begin():
+            repository = PlatformRepository(session)
+            credential = await repository.get_admin_credential(for_update=True)
+            if credential is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="administrator authentication is not configured",
+                )
+            if not verify_admin_password(
+                body.current_password,
+                credential.password_hash,
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="current password is incorrect",
+                )
+            await repository.update_admin_password(
+                credential,
+                hash_admin_password(body.new_password),
+            )
+        auth: AdminAuth = request.app.state.admin_auth
+        response = Response(status_code=status.HTTP_204_NO_CONTENT)
+        response.delete_cookie(
+            auth.cookie_name,
+            httponly=True,
+            secure=auth.cookie_secure,
+            samesite="strict",
+            path="/",
+        )
+        return response
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:
@@ -194,6 +400,59 @@ def create_app(
     async def ready(session: SessionDependency) -> dict[str, str]:
         await session.execute(text("SELECT 1"))
         return {"status": "ready"}
+
+    def api_token_response(token: Any) -> ApiTokenResponse:
+        return ApiTokenResponse(
+            id=token.id,
+            name=token.name,
+            token_prefix=token.token_prefix,
+            active=token.revoked_at is None,
+            created_at=token.created_at,
+            revoked_at=token.revoked_at,
+        )
+
+    @app.get("/admin/api-tokens", response_model=list[ApiTokenResponse])
+    async def list_api_tokens(
+        session: SessionDependency,
+    ) -> list[ApiTokenResponse]:
+        tokens = await PlatformRepository(session).list_api_tokens()
+        return [api_token_response(token) for token in tokens]
+
+    @app.post(
+        "/admin/api-tokens",
+        response_model=CreatedApiTokenResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_api_token(
+        body: CreateApiTokenRequest,
+        session: SessionDependency,
+    ) -> CreatedApiTokenResponse:
+        value, token_hash, token_prefix = issue_api_token()
+        async with session.begin():
+            token = await PlatformRepository(session).create_api_token(
+                name=body.name,
+                token_hash=token_hash,
+                token_prefix=token_prefix,
+            )
+        return CreatedApiTokenResponse(
+            **api_token_response(token).model_dump(),
+            token=value,
+        )
+
+    @app.delete(
+        "/admin/api-tokens/{token_id}",
+        response_model=ApiTokenResponse,
+    )
+    async def revoke_api_token(
+        token_id: uuid.UUID,
+        session: SessionDependency,
+    ) -> ApiTokenResponse:
+        try:
+            async with session.begin():
+                token = await PlatformRepository(session).revoke_api_token(token_id)
+        except NotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return api_token_response(token)
 
     def runtime_version_response(
         record: RuntimeProfileRecord,
@@ -208,6 +467,7 @@ def create_app(
             python_version=version.python_version,
             worker_pool=version.worker_pool,
             pip_source=version.pip_source,
+            pip_index_url=version.pip_index_url,
             requested_dependencies=version.requested_dependencies,
             resolved_dependencies=version.resolved_dependencies,
             import_checks=version.import_checks,
@@ -234,6 +494,7 @@ def create_app(
                 dependencies=version.requested_dependencies,
                 import_checks=version.import_checks,
                 pip_source=version.pip_source,
+                pip_index_url=version.pip_index_url,
             )
         except RuntimeProfileValidationError as error:
             async with session.begin():
@@ -319,6 +580,7 @@ def create_app(
                 worker_pool=version.worker_pool,
                 runtime_env=dict(version.runtime_env or {}),
                 pip_source=version.pip_source,
+                pip_index_url=version.pip_index_url,
             )
         snapshots = await app.state.profile_scheduler.actor_pool_statuses()
         return [
@@ -530,19 +792,29 @@ def create_app(
             ),
             None,
         )
+        endpoints = (
+            [dict(item) for item in active_revision.manifest["endpoints"]]
+            if active_revision is not None
+            else []
+        )
+        retention_counts = await repository.endpoint_invocation_retention_counts(
+            service.id,
+            [item["id"] for item in endpoints],
+        )
+        for endpoint in endpoints:
+            endpoint["log_retention_count"] = retention_counts[endpoint["id"]]
+        active_revision_response = (
+            revision_detail_response(active_revision)
+            if active_revision is not None
+            else None
+        )
+        if active_revision_response is not None:
+            active_revision_response.endpoints = endpoints
         return ServiceDetailResponse(
             **ServiceResponse.model_validate(service).model_dump(),
             revision_count=len(revisions),
-            active_revision=(
-                revision_detail_response(active_revision)
-                if active_revision is not None
-                else None
-            ),
-            endpoints=(
-                list(active_revision.manifest["endpoints"])
-                if active_revision is not None
-                else []
-            ),
+            active_revision=active_revision_response,
+            endpoints=endpoints,
         )
 
     @app.patch(
@@ -562,6 +834,43 @@ def create_app(
         except InvalidTransitionError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return await get_service_detail(service_id, session)
+
+    @app.delete(
+        "/admin/services/{service_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_service(
+        service_id: uuid.UUID,
+        session: SessionDependency,
+    ) -> Response:
+        try:
+            async with session.begin():
+                await PlatformRepository(session).delete_service(service_id)
+        except NotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except InvalidTransitionError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        await app.state.grpc_routes.refresh(app.state.session_factory)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.patch(
+        "/admin/services/{service_id}/endpoints/{endpoint_id}/invocation-policy",
+        response_model=EndpointInvocationPolicyResponse,
+    )
+    async def update_endpoint_invocation_policy(
+        service_id: uuid.UUID,
+        endpoint_id: str,
+        body: UpdateEndpointInvocationPolicyRequest,
+        session: SessionDependency,
+    ) -> EndpointInvocationPolicyResponse:
+        try:
+            async with session.begin():
+                policy = await PlatformRepository(
+                    session
+                ).update_endpoint_invocation_policy(service_id, endpoint_id, body)
+        except NotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        return EndpointInvocationPolicyResponse.model_validate(policy)
 
     @app.get(
         "/admin/services/{service_id}/webhook",
@@ -733,7 +1042,7 @@ def create_app(
 
     async def resolve_revision_profile(
         repository: PlatformRepository,
-        interface: RevisionInterfaceSpec,
+        interface: RevisionInterfaceSpec | ArtifactProjectSpec,
     ) -> RuntimeProfileRecord | None:
         try:
             profile = await repository.get_runtime_profile(
@@ -756,6 +1065,43 @@ def create_app(
             dependencies=interface.dependencies,
         )
         return profile
+
+    async def discover_revision_interface(
+        artifact_uri: str,
+        artifact_digest: str,
+        project: ArtifactProjectSpec,
+        runtime_profile: RuntimeProfileRecord | None,
+    ) -> tuple[RevisionInterfaceSpec, str]:
+        """Discover decorators locally or in the selected Ray Runtime Env."""
+
+        if runtime_profile is None:
+            interface = await asyncio.to_thread(
+                parse_artifact_interface,
+                artifact_uri,
+                artifact_digest,
+            )
+            return interface, artifact_uri
+
+        # A local Git checkout is not visible to Kubernetes workers. Publish
+        # the immutable source first and give the validation task a presigned
+        # distribution URI. Content-addressed storage makes this idempotent.
+        stored_uri = await asyncio.to_thread(
+            app.state.artifact_store.publish,
+            artifact_uri,
+            artifact_digest,
+        )
+        distribution_uri = app.state.artifact_store.distribution_uri(stored_uri)
+        version = runtime_profile.version
+        interface = await app.state.interface_inspector.inspect(
+            distribution_uri,
+            artifact_digest,
+            project,
+            runtime_env=dict(version.runtime_env or {}),
+            worker_pool=version.worker_pool,
+            pip_source=version.pip_source,
+            pip_index_url=version.pip_index_url,
+        )
+        return interface, distribution_uri
 
     async def persist_resolved_revision(
         *,
@@ -784,6 +1130,7 @@ def create_app(
             app.state.contract_publisher.prepare_generated_artifact,
             service_name,
             source_body,
+            service_id=service_id,
             previous_descriptor=previous_descriptor,
             previous_version=previous_version,
         )
@@ -866,8 +1213,8 @@ def create_app(
                 git_url,
                 git_branch,
             )
-            interface = await asyncio.to_thread(
-                parse_artifact_interface,
+            project = await asyncio.to_thread(
+                parse_artifact_project,
                 artifact.uri,
                 artifact.digest,
             )
@@ -881,11 +1228,17 @@ def create_app(
                     return RevisionResponse.model_validate(existing)
                 runtime_profile = await resolve_revision_profile(
                     repository,
-                    interface,
+                    project,
                 )
+            interface, source_uri = await discover_revision_interface(
+                artifact.uri,
+                artifact.digest,
+                project,
+                runtime_profile,
+            )
             source_body = ResolvedRevisionRequest(
                 revision=artifact.revision,
-                artifact_uri=artifact.uri,
+                artifact_uri=source_uri,
                 artifact_digest=artifact.digest,
                 endpoints=interface.endpoints,
                 grpc_contract=interface.grpc_contract,
@@ -1047,16 +1400,22 @@ def create_app(
             async with session.begin():
                 service = await PlatformRepository(session).get_service(service_id)
                 service_name = service.name
-            interface = await asyncio.to_thread(
-                parse_artifact_interface,
+            project = await asyncio.to_thread(
+                parse_artifact_project,
                 source_uri,
                 body.artifact_digest,
             )
             async with session.begin():
                 runtime_profile = await resolve_revision_profile(
                     PlatformRepository(session),
-                    interface,
+                    project,
                 )
+            interface, source_uri = await discover_revision_interface(
+                source_uri,
+                body.artifact_digest,
+                project,
+                runtime_profile,
+            )
             source_body = ResolvedRevisionRequest(
                 **body.model_dump(exclude={"artifact_uri"}),
                 artifact_uri=source_uri,
@@ -1193,8 +1552,8 @@ def create_app(
             source_uri = app.state.artifact_store.distribution_uri(
                 revision.artifact_uri
             )
-            interface = await asyncio.to_thread(
-                parse_artifact_interface,
+            project = await asyncio.to_thread(
+                parse_artifact_project,
                 source_uri,
                 revision.artifact_digest,
             )
@@ -1205,8 +1564,6 @@ def create_app(
             contract_metadata = revision.manifest.get("grpc_contract")
             if contract_metadata is not None:
                 grpc_contract = GrpcContractSpec.model_validate(contract_metadata)
-            elif interface.grpc_contract is not None:
-                grpc_contract = interface.grpc_contract
             else:
                 grpc_endpoints = [
                     endpoint for endpoint in endpoints if endpoint.grpc is not None
@@ -1239,8 +1596,8 @@ def create_app(
                 endpoints=endpoints,
                 grpc_contract=grpc_contract,
                 runtime_profile=revision.runtime_profile,
-                requires_python=interface.requires_python,
-                dependencies=interface.dependencies,
+                requires_python=project.requires_python,
+                dependencies=list(project.dependencies),
             )
             published = await asyncio.to_thread(
                 app.state.contract_publisher.publish,
@@ -1313,6 +1670,83 @@ def create_app(
                 request.url_for("download_contract_proto", contract_id=contract.id)
             ),
         )
+
+    @app.get("/v1/catalog", response_model=list[PublicServiceResponse])
+    async def public_api_catalog(
+        request: Request,
+        session: SessionDependency,
+    ) -> list[PublicServiceResponse]:
+        repository = PlatformRepository(session)
+        targets = await repository.list_active_endpoints()
+        grouped: dict[str, PublicServiceResponse] = {}
+        for target in targets:
+            raw_endpoint = next(
+                item
+                for item in target.endpoint_manifest
+                if item["id"] == target.endpoint_id
+            )
+            endpoint = EndpointSpec.from_manifest(raw_endpoint)
+            public_transports = [
+                transport
+                for transport in endpoint.io_type
+                if transport in {"rest", "grpc"}
+            ]
+            if not public_transports:
+                continue
+            public_service = grouped.setdefault(
+                target.service_name,
+                PublicServiceResponse(
+                    name=target.service_name,
+                    revision=target.revision,
+                    endpoints=[],
+                ),
+            )
+            rest_path = (
+                f"/v1/services/{target.service_name}/{target.endpoint_id}"
+                if "rest" in endpoint.io_type
+                else None
+            )
+            grpc_service = endpoint.grpc.service if endpoint.grpc else None
+            grpc_method = endpoint.grpc.method if endpoint.grpc else None
+            public_service.endpoints.append(
+                PublicEndpointResponse(
+                    id=endpoint.id,
+                    task_type=endpoint.task_type,
+                    io_type=public_transports,
+                    parameters=endpoint.parameters,
+                    response_schema=endpoint.response_schema,
+                    rest_path=rest_path,
+                    grpc_service=grpc_service,
+                    grpc_method=grpc_method,
+                )
+            )
+            if (
+                "grpc" in endpoint.io_type
+                and public_service.grpc_contract_url is None
+            ):
+                try:
+                    bundle = await repository.get_active_contract(target.service_name)
+                    await ensure_contract_artifacts(bundle, session)
+                except (
+                    NotFoundError,
+                    ContractBuildError,
+                    InterfaceMetadataError,
+                    ArtifactStoreError,
+                ):
+                    public_service.grpc_contract_url = str(
+                        request.url_for(
+                            "get_active_grpc_contract",
+                            service_name=target.service_name,
+                        )
+                    )
+                else:
+                    public_service.grpc_contract_url = str(
+                        request.url_for(
+                            "download_contract_proto",
+                            contract_id=bundle.contract.id,
+                        )
+                    )
+        return list(grouped.values())
 
     @app.get(
         "/v1/services/{service_name}/grpc-contract",
@@ -1387,9 +1821,24 @@ def create_app(
         params: dict[str, Any],
     ) -> InvocationResponse:
         factory = request.app.state.session_factory
+        access_token = bearer_token(request.headers.get("authorization"))
+        if access_token is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="valid API token required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         try:
             async with session_scope(factory) as session:
                 repository = PlatformRepository(session)
+                if not await repository.validate_api_token(
+                    hash_api_token(access_token)
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="valid API token required",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
                 target = await repository.resolve_endpoint(service_name, endpoint_id)
                 if "rest" not in target.io_type:
                     raise NotFoundError("active service REST endpoint does not exist")
@@ -1453,7 +1902,25 @@ def create_app(
                     log_bytes=outcome.log_bytes,
                     logs_truncated=outcome.logs_truncated,
                 )
-            raise HTTPException(status_code=502, detail="script execution failed")
+            return InvocationResponse(
+                request_id=request_id,
+                service=target.service_name,
+                revision=target.revision,
+                status="FAILED",
+                error=error_text or "script execution failed",
+                result=None,
+                logs=[
+                    ExecutionLogResponse(
+                        sequence=chunk.sequence,
+                        stream=chunk.stream,
+                        content=chunk.content,
+                        emitted_at=chunk.emitted_at,
+                    )
+                    for chunk in outcome.logs
+                ],
+                log_bytes=outcome.log_bytes,
+                logs_truncated=outcome.logs_truncated,
+            )
 
         async with session_scope(factory) as session:
             await PlatformRepository(session).finish_invocation(
@@ -1467,11 +1934,28 @@ def create_app(
             request_id=request_id,
             service=target.service_name,
             revision=target.revision,
+            status="SUCCEEDED",
             result=outcome.value,
+            logs=[
+                ExecutionLogResponse(
+                    sequence=chunk.sequence,
+                    stream=chunk.stream,
+                    content=chunk.content,
+                    emitted_at=chunk.emitted_at,
+                )
+                for chunk in outcome.logs
+            ],
+            log_bytes=outcome.log_bytes,
+            logs_truncated=outcome.logs_truncated,
         )
 
     ui_dist = app_settings.ui_dist_path.resolve()
     if app_settings.serve_ui and ui_dist.is_dir():
+        @app.get("/api-docs", include_in_schema=False)
+        @app.get("/api-docs/", include_in_schema=False)
+        async def api_docs_page() -> FileResponse:
+            return FileResponse(ui_dist / "index.html")
+
         app.mount("/", StaticFiles(directory=ui_dist, html=True), name="ui")
 
     return app
