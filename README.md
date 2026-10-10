@@ -4,6 +4,10 @@
 revisions. Revisions sharing an immutable runtime profile can be hot-loaded
 into the same actor while retaining isolated Python module namespaces.
 
+日常使用见 [用户使用指南](./USER_GUIDE.md)，部署步骤见
+[项目部署指南](./deploy/README.md)，脚本编写规则见
+[Hook 接入规范](./pyproject_interface.md)。
+
 ## Current vertical slice
 
 - Register a Git-backed service.
@@ -20,6 +24,9 @@ into the same actor while retaining isolated Python module namespaces.
   lightweight SolidJS console.
 
 ## Configuration
+
+项目部署步骤见 [deploy/README.md](./deploy/README.md)：准备数据库和对象存储、
+部署 Kubernetes/K3s Ray 集群、配置并启动 Compose、发布服务及验证调用。
 
 Copy `.env.example` to `.env` and provide the database password locally. Do
 not commit `.env`.
@@ -84,16 +91,9 @@ docker compose down
 deploy new control-plane or UI code. Run only one Uvicorn worker per container
 because that process owns the gRPC listener.
 
-For private SSH Git repositories, set `PYSCRIPTS_GIT_SSH_DIR` in `.env` to an
-absolute path containing a dedicated deploy key and a pinned `known_hosts`
-file. The directory and key must be readable by container UID 10001. Then use
-the optional read-only mount:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.ssh.yml up -d --build
-```
-
-Do not place SSH keys in the image or the Git repository.
+Service registration and repository URL updates accept only HTTP or HTTPS Git
+addresses, such as `https://git.example.com/team/orders.git`. SSH, `git://`,
+`file://`, and local filesystem paths are rejected by the management API.
 
 ### Web console
 
@@ -122,7 +122,8 @@ FastAPI mounts `ui/dist` at `/` after all API routes. Set
 
 HTTP and gRPC run in the same process on ports `8000` and `50051` by default.
 Run one application worker per pod because each process owns its gRPC listener and
-immutable route snapshot. Horizontal scaling should happen at the pod level.
+immutable route snapshot. Start with one control-plane replica; multi-replica HA
+requires additional coordination for publication, pool scaling, and local limits.
 
 Run `uv run pyscripts-db` without `--init` for a read-only connectivity and
 table check.

@@ -8,6 +8,7 @@ import logging
 import secrets
 import urllib.parse
 import uuid
+from anyio import CancelScope
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
@@ -27,6 +28,7 @@ from pyscripts.auth import AdminAuth, hash_admin_password, verify_admin_password
 from pyscripts.config import Settings, get_settings
 from pyscripts.contracts import ProtoContractPublisher
 from pyscripts.contracts.builder import ContractBuildError
+from pyscripts.contracts.validation import ContractValidationError, validate_value
 from pyscripts.db import (
     create_engine,
     create_schema,
@@ -176,9 +178,11 @@ def create_app(
             worker_pool_catalog or create_worker_pool_catalog(app_settings)
         )
         app.state.background_tasks = set()
+        app.state.profile_retirement_tasks = {}
+        app.state.profile_retirement_slots = asyncio.Semaphore(4)
         app.state.service_sync_locks = {}
         app.state.contract_publisher = ProtoContractPublisher(
-            app_settings.contract_artifact_root
+            app_settings.contract_cache_root
         )
         app.state.grpc_routes = GrpcRouteRegistry()
         await app.state.grpc_routes.refresh(app.state.session_factory)
@@ -205,6 +209,9 @@ def create_app(
                 )
             )
 
+        retirement_reconciler = asyncio.create_task(reconcile_retirements_forever())
+        app.state.background_tasks.add(retirement_reconciler)
+        retirement_reconciler.add_done_callback(app.state.background_tasks.discard)
         try:
             yield
         finally:
@@ -643,21 +650,40 @@ def create_app(
 
     async def drain_and_retire_profile(
         version_id: uuid.UUID,
-        environment_digest: str,
+        environment_digest: str | None,
     ) -> None:
+        # A retry or recovery must not drain an active/referenced environment.
+        async with app.state.session_factory() as session:
+            repository = PlatformRepository(session)
+            try:
+                record = await repository.get_runtime_profile(version_id)
+            except NotFoundError:
+                return
+            if (
+                record.version.status != RuntimeProfileStatus.RETIRING
+                or record.label.active_version_id == version_id
+                or record.reference_count
+            ):
+                return
         timeout = app_settings.runtime_profile_retirement_timeout_seconds
-        drained = await app.state.profile_scheduler.retire_profile(
-            environment_digest,
-            timeout_seconds=timeout,
-        )
-        if not drained:
-            return
+        if environment_digest:
+            drained = await app.state.profile_scheduler.retire_profile(
+                environment_digest,
+                timeout_seconds=timeout,
+            )
+            if not drained:
+                logger.warning("runtime retirement timed out: version=%s", version_id)
+                return
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
             async with app.state.session_factory() as execution_session:
-                active = await PlatformRepository(
-                    execution_session
-                ).active_runtime_execution_count(environment_digest)
+                active = (
+                    await PlatformRepository(execution_session).active_runtime_execution_count(
+                        environment_digest
+                    )
+                    if environment_digest
+                    else 0
+                )
             if active == 0:
                 break
             if asyncio.get_running_loop().time() >= deadline:
@@ -673,13 +699,45 @@ def create_app(
 
     def schedule_profile_retirement(
         version_id: uuid.UUID,
-        environment_digest: str,
+        environment_digest: str | None,
     ) -> None:
-        task = asyncio.create_task(
-            drain_and_retire_profile(version_id, environment_digest)
-        )
+        if version_id in app.state.profile_retirement_tasks:
+            return
+
+        async def run() -> None:
+            try:
+                async with app.state.profile_retirement_slots:
+                    await drain_and_retire_profile(version_id, environment_digest)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("runtime retirement failed: version=%s", version_id)
+
+        task = asyncio.create_task(run())
+        app.state.profile_retirement_tasks[version_id] = task
         app.state.background_tasks.add(task)
-        task.add_done_callback(app.state.background_tasks.discard)
+
+        def completed(task: asyncio.Task[Any]) -> None:
+            app.state.background_tasks.discard(task)
+            if app.state.profile_retirement_tasks.get(version_id) is task:
+                app.state.profile_retirement_tasks.pop(version_id, None)
+
+        task.add_done_callback(completed)
+
+    async def reconcile_retirements_forever() -> None:
+        # Scan immediately on startup. RETIRING is the durable work queue;
+        # unsuccessful attempts remain eligible after errors, timeouts/restarts.
+        while True:
+            try:
+                async with app.state.session_factory() as session:
+                    versions = await PlatformRepository(session).list_retiring_runtime_profiles()
+                    for version in versions:
+                        schedule_profile_retirement(version.id, version.environment_digest)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("failed to reconcile runtime retirements")
+            await asyncio.sleep(app_settings.runtime_profile_retirement_retry_seconds)
 
     @app.post(
         "/admin/runtime-profile-versions/{version_id}/activate",
@@ -725,10 +783,7 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except InvalidTransitionError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
-        if record.version.environment_digest:
-            schedule_profile_retirement(
-                record.version.id, record.version.environment_digest
-            )
+        schedule_profile_retirement(record.version.id, record.version.environment_digest)
         return runtime_version_response(record)
 
     @app.post(
@@ -1842,6 +1897,16 @@ def create_app(
                 target = await repository.resolve_endpoint(service_name, endpoint_id)
                 if "rest" not in target.io_type:
                     raise NotFoundError("active service REST endpoint does not exist")
+                endpoint = EndpointSpec.from_manifest(
+                    next(
+                        item for item in target.endpoint_manifest
+                        if item["id"] == target.endpoint_id
+                    )
+                )
+                try:
+                    validate_value(params, endpoint.request_schema)
+                except ContractValidationError as error:
+                    raise HTTPException(status_code=422, detail=error.detail()) from error
                 invocation = await repository.begin_invocation(
                     target,
                     transport="REST",
@@ -1857,6 +1922,15 @@ def create_app(
                 ),
                 timeout=app_settings.invocation_timeout_seconds,
             )
+        except asyncio.CancelledError:
+            # Starlette middleware uses level-triggered AnyIO cancellation;
+            # shield the database cleanup or every await is cancelled again.
+            with CancelScope(shield=True):
+                async with session_scope(factory) as session:
+                    await PlatformRepository(session).finish_invocation(
+                        request_id, InvocationStatus.CANCELLED, "request cancelled"
+                    )
+            raise
         except PoolOverloadedError as error:
             async with session_scope(factory) as session:
                 await PlatformRepository(session).finish_invocation(
@@ -1887,6 +1961,14 @@ def create_app(
             if isinstance(raw_result, ExecutionOutcome)
             else ExecutionOutcome(succeeded=True, value=raw_result)
         )
+        if outcome.succeeded:
+            try:
+                validate_value(outcome.value, endpoint.response_schema, ("result",))
+            except ContractValidationError as error:
+                outcome = replace(
+                    outcome, succeeded=False, value=None,
+                    error_type="ContractValidationError", error_message=str(error),
+                )
         if not outcome.succeeded:
             error_text = ": ".join(
                 part

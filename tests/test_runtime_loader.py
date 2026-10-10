@@ -3,10 +3,41 @@ from __future__ import annotations
 import hashlib
 import asyncio
 import zipfile
+import threading
 from pathlib import Path
+import pytest
 
 from pyscripts.runtime.loader import EndpointDefinition, VersionedRuntime
 from pyscripts.runtime.output import ExecutionOutcome
+
+
+async def test_cancelled_waiter_does_not_cancel_shared_initialization(tmp_path, monkeypatch):
+    artifact = tmp_path / "shared.zip"
+    digest = build_artifact(artifact, 1)
+    runtime = VersionedRuntime(tmp_path / "runtime")
+    entered, release = threading.Event(), threading.Event()
+    original = runtime._load_version
+
+    def load(*args):
+        entered.set()
+        assert release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(runtime, "_load_version", load)
+    args = ("svc", "rev", artifact.as_uri(), digest, [EndpointDefinition("add", "compute", "service:add")])
+    first = asyncio.create_task(runtime.ensure_loaded(*args))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        second = asyncio.create_task(runtime.ensure_loaded(*args))
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+    finally:
+        release.set()
+    loaded = await asyncio.wait_for(second, 5)
+    assert runtime._versions[("svc", "rev")] is loaded
+    assert not runtime._load_tasks
+    assert await runtime.drain("svc", "rev")
 
 
 def build_artifact(path: Path, offset: int) -> str:

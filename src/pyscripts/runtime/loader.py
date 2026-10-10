@@ -280,8 +280,7 @@ class VersionedRuntime:
             task = self._load_tasks.get(key)
             if task is None:
                 task = asyncio.create_task(
-                    asyncio.to_thread(
-                        self._load_version,
+                    self._load_and_register(
                         service,
                         revision,
                         artifact_uri,
@@ -290,18 +289,34 @@ class VersionedRuntime:
                     )
                 )
                 self._load_tasks[key] = task
+                # Observe errors even if all request waiters were cancelled.
+                task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
 
+        # Loading is shared between requests and includes non-cancellable
+        # thread work. A cancelled waiter must not abandon the imported modules
+        # or cancel another request's initialization.
+        return await asyncio.shield(task)
+
+    async def _load_and_register(
+        self,
+        service: str,
+        revision: str,
+        artifact_uri: str,
+        artifact_digest: str,
+        endpoints: list[EndpointDefinition],
+    ) -> LoadedVersion:
+        key = (service, revision)
         try:
-            loaded = await task
-        except BaseException:
+            loaded = await asyncio.to_thread(
+                self._load_version, service, revision, artifact_uri, artifact_digest, endpoints,
+            )
             async with self._registry_lock:
-                self._load_tasks.pop(key, None)
-            raise
-
-        async with self._registry_lock:
-            self._versions[key] = loaded
-            self._load_tasks.pop(key, None)
-        return loaded
+                self._versions[key] = loaded
+            return loaded
+        finally:
+            async with self._registry_lock:
+                if self._load_tasks.get(key) is asyncio.current_task():
+                    self._load_tasks.pop(key, None)
 
     def _load_version(
         self,

@@ -1,16 +1,50 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import subprocess
 import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+import httpx
+import pytest
 
 from pyscripts.api import create_app
 from pyscripts.config import Settings
 from pyscripts.runtime.output import CapturedLogChunk, ExecutionOutcome
+
+
+async def test_cancelled_http_invocation_is_finalized(tmp_path):
+    artifact, digest = build_artifact(tmp_path)
+    app = create_app(Settings(
+        database_url=SecretStr(f"sqlite+aiosqlite:///{tmp_path / 'cancel.db'}"),
+        grpc_enabled=False, ray_use_label_selector=False,
+        require_registered_runtime_profiles=False,
+    ))
+    entered = asyncio.Event()
+
+    class WaitingScheduler:
+        async def execute(self, target, request_id, params):
+            entered.set()
+            await asyncio.Event().wait()
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            assert (await client.post('/auth/login', json={"password": "test-admin-password"})).status_code == 200
+            service = (await client.post('/admin/services', json={"name": "cancel-service", "git_url": "https://example.invalid/cancel.git"})).json()
+            published = await client.post(f"/admin/services/{service['id']}/revisions/import", json={"revision": "cancel-rev", "artifact_uri": artifact.as_uri(), "artifact_digest": digest})
+            assert published.status_code == 201
+            token = (await client.post('/admin/api-tokens', json={"name": "cancel-test"})).json()['token']
+            app.state.profile_scheduler = WaitingScheduler()
+            invocation = asyncio.create_task(client.post('/v1/services/cancel-service/run', json={"value": 1}, headers={"Authorization": "Bearer " + token}))
+            await asyncio.wait_for(entered.wait(), 2)
+            invocation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await invocation
+            records = (await client.get('/admin/invocations')).json()
+            assert records[0]['status'] == 'CANCELLED'
 
 
 def login_admin(client: TestClient) -> None:
@@ -129,6 +163,15 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
         )
         assert relogin.status_code == 200
         assert relogin.json()["username"] == "admin"
+        rejected_service = client.post(
+            "/admin/services",
+            json={
+                "name": "ssh-service",
+                "git_url": "ssh://git@example.invalid/math.git",
+            },
+        )
+        assert rejected_service.status_code == 422
+        assert rejected_service.json()["detail"][0]["loc"] == ["body", "git_url"]
         service_response = client.post(
             "/admin/services",
             json={
@@ -142,6 +185,14 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
         service = service_response.json()
         assert service["created_at"]
         assert service["git_branch"] == "release/v1"
+        rejected_update = client.patch(
+            f"/admin/services/{service['id']}",
+            json={"git_url": "git@example.invalid:math.git"},
+        )
+        assert rejected_update.status_code == 422
+        assert client.get(f"/admin/services/{service['id']}").json()["git_url"] == (
+            "https://example.invalid/math.git"
+        )
 
         revision_response = client.post(
             f"/admin/services/{service['id']}/revisions/import",
@@ -272,8 +323,11 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
         assert service_invocations.status_code == 200
         assert service_invocations.json() == []
 
+        executions = []
+
         class FakeScheduler:
             async def execute(self, target, request_id, params):
+                executions.append(params)
                 return ExecutionOutcome(
                     succeeded=True,
                     value=params["value"],
@@ -284,6 +338,15 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
                 )
 
         app.state.profile_scheduler = FakeScheduler()
+        for invalid in ({}, {"value": 1, "extra": 2}, {"value": "secret"},
+                        {"value": True}, {"value": 2**63}, {"value": 1.0}):
+            rejected = client.post(
+                "/v1/services/math-service/run", json=invalid, headers=access_headers,
+            )
+            assert rejected.status_code == 422
+            assert "input" not in rejected.json()["detail"][0]
+        assert executions == []
+        assert client.get("/admin/invocations").json() == []
         missing_token = client.post(
             "/v1/services/math-service/run",
             json={"value": 42},
@@ -367,6 +430,23 @@ def test_control_plane_vertical_slice(tmp_path: Path) -> None:
         ).json()
         assert len(retained) == 1
         assert retained[0]["id"] == failed.json()["request_id"]
+        class InvalidResultScheduler:
+            async def execute(self, target, request_id, params):
+                return ExecutionOutcome(
+                    succeeded=True, value=2**63,
+                    logs=(CapturedLogChunk(0, "STDOUT", "result log\n"),),
+                    log_bytes=11,
+                )
+
+        app.state.profile_scheduler = InvalidResultScheduler()
+        invalid_result = client.post(
+            "/v1/services/math-service/run", json={"value": 1}, headers=access_headers,
+        )
+        assert invalid_result.status_code == 200
+        assert invalid_result.json()["status"] == "FAILED"
+        assert "ContractValidationError" in invalid_result.json()["error"]
+        assert invalid_result.json()["result"] is None
+        assert invalid_result.json()["logs"][0]["content"] == "result log\n"
         revoked = client.delete(f"/admin/api-tokens/{token_record['id']}")
         assert revoked.status_code == 200
         assert revoked.json()["active"] is False
@@ -646,11 +726,19 @@ def test_manual_publish_builds_revision_from_git_head(tmp_path: Path) -> None:
 
     with TestClient(app) as client:
         login_admin(client)
+        # Keep real Git archive coverage without an external HTTP Git server.
+        build_local_repository = app.state.git_artifact_builder.build
+
+        def build_test_repository(git_url: str, git_branch: str | None = None):
+            assert git_url == "https://example.invalid/source.git"
+            return build_local_repository(str(repository), git_branch)
+
+        app.state.git_artifact_builder.build = build_test_repository
         service = client.post(
             "/admin/services",
             json={
                 "name": "git-service",
-                "git_url": str(repository),
+                "git_url": "https://example.invalid/source.git",
                 "git_branch": branch,
             },
         ).json()

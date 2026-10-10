@@ -88,7 +88,7 @@ def test_grpc_contract_publishes_persistent_proto_bundle(
     app = create_app(
         Settings(
             database_url=SecretStr(f"sqlite+aiosqlite:///{tmp_path / 'api.db'}"),
-            contract_artifact_root=tmp_path / "contracts",
+            contract_cache_root=tmp_path / "contracts",
             actor_cache_root=tmp_path / "runtime",
             grpc_host="127.0.0.1",
             grpc_port=0,
@@ -193,7 +193,7 @@ def test_interface_metadata_generates_proto_bundle(tmp_path: Path) -> None:
     app = create_app(
         Settings(
             database_url=SecretStr(f"sqlite+aiosqlite:///{tmp_path / 'auto.db'}"),
-            contract_artifact_root=tmp_path / "contracts-auto",
+            contract_cache_root=tmp_path / "contracts-auto",
             actor_cache_root=tmp_path / "runtime-auto",
             grpc_host="127.0.0.1",
             grpc_port=0,

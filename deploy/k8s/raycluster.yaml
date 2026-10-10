@@ -1,4 +1,5 @@
 # KubeRay 1.7 / Ray 2.58 execution cluster for pyscripts.
+# Deployment guide (including Ray setup): ../README.md
 #
 # Apply after installing the KubeRay operator:
 #   kubectl apply -f deploy/k8s/raycluster.yaml

@@ -1,0 +1,20 @@
+# Optional Ray Client entry point for a controlled LAN or Docker Compose host.
+# Configure network access restrictions before applying. For token-enabled
+# clusters, external clients must also receive the matching Ray auth token.
+# Dashboard and GCS are intentionally not published by this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: pyscripts-ray-client-lan
+  namespace: pyscripts
+spec:
+  type: NodePort
+  selector:
+    ray.io/cluster: pyscripts-ray
+    ray.io/node-type: head
+  ports:
+    - name: ray-client
+      protocol: TCP
+      port: 10001
+      targetPort: 10001
+      nodePort: 31001

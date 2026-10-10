@@ -26,6 +26,30 @@ ENTRYPOINT = re.compile(
 )
 
 
+def validate_git_http_url(value: str) -> str:
+    url = value.strip()
+    message = "git_url must be a valid HTTP or HTTPS Git repository URL"
+    if not url or any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in url
+    ):
+        raise ValueError(message)
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or "\\" in parsed.netloc
+            or parsed.fragment
+            or port == 0
+        ):
+            raise ValueError(message)
+    except ValueError as error:
+        raise ValueError(message) from error
+    return url
+
+
 def validate_git_branch_name(value: str) -> str:
     branch = value.strip()
     invalid_character = any(
@@ -62,6 +86,11 @@ class CreateServiceRequest(BaseModel):
     tracking_mode: Literal["manual", "poll", "webhook"] = "manual"
     check_interval_seconds: int | None = Field(default=None, ge=10)
 
+    @field_validator("git_url")
+    @classmethod
+    def validate_git_url(cls, value: str) -> str:
+        return validate_git_http_url(value)
+
     @field_validator("name")
     @classmethod
     def validate_name(cls, value: str) -> str:
@@ -95,6 +124,13 @@ class UpdateServiceRequest(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    @field_validator("git_url")
+    @classmethod
+    def validate_git_url(cls, value: str | None) -> str:
+        if value is None:
+            raise ValueError("git_url cannot be null")
+        return validate_git_http_url(value)
+
     @field_validator("git_branch")
     @classmethod
     def validate_git_branch(cls, value: str | None) -> str | None:
@@ -104,8 +140,6 @@ class UpdateServiceRequest(BaseModel):
     def require_changes(self) -> UpdateServiceRequest:
         if not self.model_fields_set:
             raise ValueError("at least one service property must be provided")
-        if self.git_url is not None and not self.git_url.strip():
-            raise ValueError("git_url cannot be blank")
         return self
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 import zipfile
 from pathlib import Path
 
@@ -142,3 +143,72 @@ def test_io_hook_remote_call_dispatches_compute_task(
     assert "io-parent" in output
     assert "io-child" in output
     assert "compute-child" in output
+
+
+def test_cancel_running_io_is_scoped_to_lease(ray_runtime, tmp_path):
+    artifact = tmp_path / "cancel.zip"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr("service.py", "import asyncio\nasync def wait(value, delay):\n    await asyncio.sleep(delay)\n    return value\n")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    manifest = [{"id": "wait", "task_type": "io", "entrypoint": "service:wait"}]
+    actor = UnifiedActor.remote("cancel-test", str(tmp_path / "runtime"), 4, 5)
+    cancelled_lease = ray.get(actor.try_reserve.remote("cancel", "io", "svc", "rev"))
+    other_lease = ray.get(actor.try_reserve.remote("other", "io", "svc", "rev"))
+    cancelled = actor.execute.remote(cancelled_lease, "wait", {}, {"value": 1, "delay": 60}, artifact.as_uri(), digest, manifest)
+    other = actor.execute.remote(other_lease, "wait", {}, {"value": 2, "delay": .4}, artifact.as_uri(), digest, manifest)
+    deadline = time.monotonic() + 5
+    while ray.get(actor.status.remote())["running_leases"] < 2:
+        assert time.monotonic() < deadline
+        time.sleep(.01)
+    start = time.monotonic()
+    assert ray.get(actor.cancel_execution.remote(cancelled_lease), timeout=5)
+    assert time.monotonic() - start < 3
+    with pytest.raises(ray.exceptions.RayError):
+        ray.get(cancelled, timeout=5)
+    assert ray.get(other, timeout=5).value == 2
+    assert ray.get(actor.status.remote())["active_io"] == 0
+    # The actor and loaded revision remain usable after a request is cancelled.
+    lease = ray.get(actor.try_reserve.remote("next", "io", "svc", "rev"))
+    result = ray.get(actor.execute.remote(lease, "wait", {}, {"value": 3, "delay": 0}, artifact.as_uri(), digest, manifest))
+    assert result.value == 3
+    reserved = ray.get(actor.try_reserve.remote("unused", "io", "svc", "rev"))
+    assert ray.get(actor.cancel_execution.remote(reserved))
+    assert not ray.get(actor.cancel_execution.remote(reserved))
+    ray.kill(actor)
+
+
+def test_cancel_io_cascades_to_compute(ray_runtime, tmp_path):
+    artifact = tmp_path / "cancel-child.zip"
+    started = tmp_path / "started"
+    finished = tmp_path / "finished"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr("service.py", (
+            "import time\nfrom pathlib import Path\nfrom sc_hook import hook, IOType, Int32\n"
+            "@hook(io_types=[IOType.Inner])\n"
+            "def slow(seconds: Int32) -> Int32:\n"
+            f"    Path({str(started)!r}).touch()\n"
+            "    time.sleep(seconds)\n"
+            f"    Path({str(finished)!r}).touch()\n"
+            "    return 42\n"
+            "@hook(io_types=[IOType.Rest])\n"
+            "async def pipeline(seconds: Int32) -> Int32:\n"
+            "    return await slow.remote_call(seconds)\n"
+        ))
+    manifest = [
+        {"id": "slow", "task_type": "compute", "entrypoint": "service:slow", "io_type": ["inner"]},
+        {"id": "pipeline", "task_type": "io", "entrypoint": "service:pipeline"},
+    ]
+    actor = UnifiedActor.remote("cancel-child", str(tmp_path / "runtime"), 2, 5)
+    lease = ray.get(actor.try_reserve.remote("cancel", "io", "svc", "rev"))
+    reference = actor.execute.remote(lease, "pipeline", {}, {"seconds": 3}, artifact.as_uri(), hashlib.sha256(artifact.read_bytes()).hexdigest(), manifest)
+    deadline = time.monotonic() + 10
+    while not started.exists():
+        assert time.monotonic() < deadline
+        time.sleep(.01)
+    assert ray.get(actor.cancel_execution.remote(lease), timeout=5)
+    with pytest.raises(ray.exceptions.RayError):
+        ray.get(reference, timeout=5)
+    assert ray.get(actor.status.remote())["active_io"] == 0
+    time.sleep(3.2)
+    assert not finished.exists()
+    ray.kill(actor)

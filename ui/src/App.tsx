@@ -200,7 +200,8 @@ const CreateServiceModal: Component<{
         </label>
         <label class="field">
           <span>Git 仓库</span>
-          <input required type="url" value={gitUrl()} onInput={(event) => setGitUrl(event.currentTarget.value)} placeholder="https://git.example.com/team/orders.git" />
+          <input required type="url" pattern="[Hh][Tt][Tt][Pp][Ss]?://.+" value={gitUrl()} onInput={(event) => setGitUrl(event.currentTarget.value)} placeholder="https://git.example.com/team/orders.git" />
+          <small>只支持 HTTP 或 HTTPS Git 仓库地址。</small>
         </label>
         <label class="field">
           <span>跟踪分支</span>
@@ -343,7 +344,8 @@ const ServiceSettingsModal: Component<{
         </label>
         <label class="field">
           <span>Git 仓库</span>
-          <input required type="url" value={gitUrl()} onInput={(event) => setGitUrl(event.currentTarget.value)} />
+          <input required type="url" pattern="[Hh][Tt][Tt][Pp][Ss]?://.+" value={gitUrl()} onInput={(event) => setGitUrl(event.currentTarget.value)} />
+          <small>只支持 HTTP 或 HTTPS Git 仓库地址。</small>
         </label>
         <label class="field">
           <span>跟踪分支</span>

@@ -4,6 +4,10 @@
 `pyscripts-hook` 的 `@hook` 装饰器声明，平台在发布阶段导入指定模块并生成
 不可变 Endpoint Manifest、REST 路由和 Proto 契约。
 
+Web UI 注册服务和修改仓库地址时，只接受 HTTP/HTTPS Git 地址，例如
+`https://git.example.com/team/orders.git`。SSH、`git://`、`file://` 和本地路径
+均不允许用于服务注册。
+
 ## `pyproject.toml`
 
 `pyproject.toml` 只保留项目和发布级信息：

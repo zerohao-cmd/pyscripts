@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     compute_warm_nodes_per_profile: int = Field(default=8, ge=1)
     runtime_env_setup_timeout_seconds: int = Field(default=900, ge=30)
     runtime_profile_retirement_timeout_seconds: float = Field(default=600, gt=0)
+    runtime_profile_retirement_retry_seconds: float = Field(default=15, gt=0)
     require_registered_runtime_profiles: bool = True
     private_pip_index_url: SecretStr | None = None
     private_pip_extra_index_urls: list[SecretStr] = Field(default_factory=list)
@@ -116,7 +117,10 @@ class Settings(BaseSettings):
     grpc_max_receive_message_bytes: int = Field(default=4 * 1024 * 1024, gt=0)
     grpc_max_send_message_bytes: int = Field(default=4 * 1024 * 1024, gt=0)
 
-    contract_artifact_root: Path = Path("/tmp/pyscripts-contracts")
+    contract_cache_root: Path = Field(
+        default=Path("/tmp/pyscripts-contracts"),
+        description="Local Proto/Descriptor build cache; published files live in object storage",
+    )
 
     serve_ui: bool = True
     ui_dist_path: Path = Path("ui/dist")

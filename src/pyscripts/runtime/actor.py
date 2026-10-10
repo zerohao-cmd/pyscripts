@@ -224,6 +224,7 @@ class UnifiedActor:
             capture_stderr=capture_stderr,
         )
         self.admission = AdmissionController(max_io, lease_ttl_seconds)
+        self._executions: dict[str, asyncio.Task[Any]] = {}
 
     async def try_reserve(
         self,
@@ -252,6 +253,9 @@ class UnifiedActor:
         endpoint_manifest: list[dict[str, Any]],
     ) -> Any:
         lease = await self.admission.start(lease_id)
+        task = asyncio.current_task()
+        assert task is not None
+        self._executions[lease_id] = task
         try:
             endpoints = [
                 EndpointDefinition.from_manifest(item) for item in endpoint_manifest
@@ -297,6 +301,7 @@ class UnifiedActor:
                 remote_call_backend=backend,
             )
         finally:
+            self._executions.pop(lease_id, None)
             await self.admission.finish(lease_id)
 
     async def execute_grpc(
@@ -310,6 +315,9 @@ class UnifiedActor:
         endpoint_manifest: list[dict[str, Any]],
     ) -> Any:
         lease = await self.admission.start(lease_id)
+        task = asyncio.current_task()
+        assert task is not None
+        self._executions[lease_id] = task
         try:
             endpoints = [
                 EndpointDefinition.from_manifest(item) for item in endpoint_manifest
@@ -355,7 +363,19 @@ class UnifiedActor:
                 remote_call_backend=backend,
             )
         finally:
+            self._executions.pop(lease_id, None)
             await self.admission.finish(lease_id)
+
+    async def cancel_execution(self, lease_id: str) -> bool:
+        """Cancel only this lease, and wait for its module/child-task cleanup."""
+        task = self._executions.get(lease_id)
+        if task is None:
+            # Cancellation may arrive before execute consumes the reservation.
+            return await self.admission.cancel_reservation(lease_id)
+        if not task.cancelling():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return True
 
     async def cancel_reservation(self, lease_id: str) -> bool:
         return await self.admission.cancel_reservation(lease_id)

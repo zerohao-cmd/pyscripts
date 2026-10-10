@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+import pytest
 
 from pydantic import SecretStr
 from ray.exceptions import RayError
@@ -14,6 +15,7 @@ from pyscripts.runtime.directory import (
     ActorCandidate,
     PoolProfile,
     ProfilePoolScheduler,
+    LeaseAssignment,
 )
 
 
@@ -74,6 +76,136 @@ def io_target() -> ResolvedEndpoint:
     )
 
 
+@pytest.mark.parametrize("transport", ["rest", "grpc"])
+async def test_scheduler_awaits_per_lease_cancellation(transport, monkeypatch):
+    scheduler = ProfilePoolScheduler(Settings(database_url=SecretStr("sqlite+aiosqlite:///:memory:")))
+    entered = asyncio.Event()
+    cancellations = []
+
+    async def run_execution(*args):
+        entered.set()
+        await asyncio.Event().wait()
+
+    async def cancel(lease):
+        await asyncio.sleep(.01)
+        cancellations.append(lease)
+
+    class Actor:
+        execute = FakeRemoteMethod(run_execution)
+        execute_grpc = FakeRemoteMethod(run_execution)
+        cancel_execution = FakeRemoteMethod(cancel)
+
+    async def reserve(*args):
+        return LeaseAssignment(Actor(), "lease")
+
+    monkeypatch.setattr(scheduler, "reserve", reserve)
+    if transport == "rest":
+        task = asyncio.create_task(scheduler.execute(io_target(), uuid.uuid4(), {}))
+    else:
+        task = asyncio.create_task(scheduler.execute_grpc(io_target(), uuid.uuid4(), b""))
+    await asyncio.wait_for(entered.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancellations == ["lease"]
+
+
+async def test_retirement_waits_for_legacy_actor_and_fails_closed(monkeypatch):
+    settings = Settings(database_url=SecretStr("sqlite+aiosqlite:///:memory:"),
+                        actor_max_per_profile=1, actor_scheduler_poll_seconds=.005)
+    scheduler = ProfilePoolScheduler(settings)
+    profile = "legacy-environment"
+    actor = FakeIdleActor(0)
+    busy = True
+    broken = False
+
+    async def status():
+        if broken:
+            raise RuntimeError("status temporarily unavailable")
+        return {"running_leases": int(busy), "reserved_leases": 0}
+
+    actor.status = FakeRemoteMethod(status)
+    legacy_name = scheduler._legacy_actor_names(profile, 0)[-1]
+
+    def get_actor(name, **kwargs):
+        if name == legacy_name:
+            return actor
+        raise ValueError("not found")
+
+    async def connected():
+        pass
+
+    killed = []
+    monkeypatch.setattr(scheduler, "_ensure_ray", connected)
+    monkeypatch.setattr(directory.ray, "get_actor", get_actor)
+    monkeypatch.setattr(directory.ray, "kill", lambda handle, **kwargs: killed.append(handle))
+    assert not await scheduler.retire_profile(profile, timeout_seconds=.02)
+    assert actor.draining
+    assert killed == []
+    broken = True
+    with pytest.raises(RuntimeError, match="status temporarily unavailable"):
+        await scheduler.retire_profile(profile, timeout_seconds=.02)
+    assert killed == []
+    broken = False
+    busy = False
+    assert await scheduler.retire_profile(profile, timeout_seconds=.02)
+    assert killed == [actor]
+
+
+async def test_retirement_bounds_unresponsive_drain_rpc(monkeypatch):
+    scheduler = ProfilePoolScheduler(Settings(database_url=SecretStr("sqlite+aiosqlite:///:memory:"), actor_max_per_profile=1))
+    actor = FakeIdleActor(0)
+
+    async def blocked():
+        await asyncio.sleep(60)
+
+    async def connected():
+        pass
+
+    actor.drain_actor = FakeRemoteMethod(blocked)
+    scheduler._actors[("env", 0)] = actor
+    monkeypatch.setattr(scheduler, "_ensure_ray", connected)
+    monkeypatch.setattr(directory.ray, "get_actor", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError()))
+    assert not await scheduler.retire_profile("env", timeout_seconds=.02)
+
+
+async def test_legacy_upgrade_rechecks_busy_actor_until_idle(monkeypatch):
+    scheduler = ProfilePoolScheduler(Settings(
+        database_url=SecretStr("sqlite+aiosqlite:///:memory:"),
+        actor_max_per_profile=1,
+    ))
+    profile = "upgrade-environment"
+    legacy_name = scheduler._legacy_actor_names(profile, 0)[-1]
+    actor = FakeIdleActor(0)
+    busy = True
+    killed = []
+
+    async def status():
+        return {"running_leases": int(busy), "reserved_leases": 0}
+
+    async def connected():
+        pass
+
+    def get_actor(name, **kwargs):
+        if name == legacy_name and not killed:
+            return actor
+        raise ValueError("not found")
+
+    actor.status = FakeRemoteMethod(status)
+    monkeypatch.setattr(scheduler, "_ensure_ray", connected)
+    monkeypatch.setattr(directory.ray, "get_actor", get_actor)
+    monkeypatch.setattr(directory.ray, "kill", lambda handle, **kwargs: killed.append(handle))
+    await scheduler._prepare_pool(profile)
+    assert actor.draining and not killed
+    assert profile not in scheduler._legacy_checked_profiles
+    busy = False
+    await scheduler._prepare_pool(profile)
+    assert killed == [actor]
+    assert profile in scheduler._legacy_checked_profiles
+    await scheduler._prepare_pool(profile)
+    assert killed == [actor]
+
+
 def test_io_packs_into_the_busiest_shared_actor() -> None:
     candidates = [
         candidate(0, "IDLE", 0),
@@ -101,7 +233,7 @@ def test_io_promotes_warm_actor_at_target_concurrency() -> None:
 
 def test_actor_name_uses_current_wire_protocol() -> None:
     assert ProfilePoolScheduler._actor_name("test@v2", 3).startswith(
-        "pyscripts-runtime-v8-"
+        "pyscripts-runtime-v9-"
     )
 
 

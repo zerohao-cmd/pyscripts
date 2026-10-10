@@ -757,7 +757,11 @@ class PlatformRepository:
         *,
         finalize: bool = False,
     ) -> RuntimeProfileRecord:
-        version = await self.session.get(RuntimeProfileVersion, version_id)
+        version = await self.session.scalar(
+            select(RuntimeProfileVersion)
+            .where(RuntimeProfileVersion.id == version_id)
+            .with_for_update()
+        )
         if version is None:
             raise NotFoundError("runtime profile version does not exist")
         label = await self.session.get(RuntimeLabel, version.label_id)
@@ -789,6 +793,13 @@ class PlatformRepository:
             version.status = RuntimeProfileStatus.RETIRING
         await self.session.flush()
         return RuntimeProfileRecord(label, version, references)
+
+    async def list_retiring_runtime_profiles(self) -> list[RuntimeProfileVersion]:
+        return list(await self.session.scalars(
+            select(RuntimeProfileVersion).where(
+                RuntimeProfileVersion.status == RuntimeProfileStatus.RETIRING
+            ).order_by(RuntimeProfileVersion.created_at)
+        ))
 
     async def list_revisions(self, service_id: uuid.UUID) -> list[Revision]:
         if await self.session.get(Service, service_id) is None:

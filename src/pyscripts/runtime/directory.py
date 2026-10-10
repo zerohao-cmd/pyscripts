@@ -7,12 +7,13 @@ import logging
 import math
 import time
 import uuid
+from anyio import CancelScope
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
 import ray
-from ray.exceptions import RayError
+from ray.exceptions import ActorDiedError, RayError
 
 from pyscripts.config import Settings
 from pyscripts.ray_client import ensure_ray
@@ -222,9 +223,7 @@ class ProfilePoolScheduler:
         try:
             return self._outcome(await reference)
         except BaseException:
-            # If execute has not consumed the lease yet this releases it. If it is
-            # already RUNNING, the actor owns release in its finally block.
-            assignment.actor.cancel_reservation.remote(assignment.lease_id)
+            await self._cancel_io_assignment(assignment)
             raise
         finally:
             self._record_duration(
@@ -275,13 +274,25 @@ class ProfilePoolScheduler:
                 raise TypeError("gRPC actor returned a non-bytes result")
             return outcome
         except BaseException:
-            assignment.actor.cancel_reservation.remote(assignment.lease_id)
+            await self._cancel_io_assignment(assignment)
             raise
         finally:
             self._record_duration(
                 target.environment_digest or target.runtime_profile,
                 time.monotonic() - execution_started,
             )
+
+    async def _cancel_io_assignment(self, assignment: LeaseAssignment) -> None:
+        try:
+            # Do not kill a shared actor. Its per-lease task owns cascading
+            # cancellation and release; bound cleanup for uncooperative code.
+            with CancelScope(shield=True):
+                await asyncio.wait_for(
+                    assignment.actor.cancel_execution.remote(assignment.lease_id),
+                    timeout=5.0,
+                )
+        except Exception:
+            logger.exception("failed to cancel IO execution: lease=%s", assignment.lease_id)
 
     async def reserve(
         self,
@@ -526,8 +537,8 @@ class ProfilePoolScheduler:
         lock = self._profile_locks.setdefault(runtime_profile, asyncio.Lock())
         async with lock:
             if runtime_profile not in self._legacy_checked_profiles:
-                await self._retire_legacy_actors(runtime_profile)
-                self._legacy_checked_profiles.add(runtime_profile)
+                if await self._retire_legacy_actors(runtime_profile):
+                    self._legacy_checked_profiles.add(runtime_profile)
             await self._discover_actors(runtime_profile)
 
     async def _schedule_actor_count(
@@ -589,20 +600,11 @@ class ProfilePoolScheduler:
                 continue
         return False
 
-    async def _retire_legacy_actors(self, runtime_profile: str) -> None:
+    async def _retire_legacy_actors(self, runtime_profile: str) -> bool:
         """Drain and reclaim detached actors using an older wire protocol."""
-        digest = hashlib.sha256(runtime_profile.encode("utf-8")).hexdigest()[:20]
+        complete = True
         for replica in range(self.settings.actor_max_per_profile):
-            names = (
-                f"pyscripts-runtime-{digest}-{replica}",
-                f"pyscripts-runtime-v2-{digest}-{replica}",
-                f"pyscripts-runtime-v3-{digest}-{replica}",
-                f"pyscripts-runtime-v4-{digest}-{replica}",
-                f"pyscripts-runtime-v5-{digest}-{replica}",
-                f"pyscripts-runtime-v6-{digest}-{replica}",
-                f"pyscripts-runtime-v7-{digest}-{replica}",
-            )
-            for actor_name in names:
+            for actor_name in self._legacy_actor_names(runtime_profile, replica):
                 try:
                     actor = ray.get_actor(
                         actor_name,
@@ -611,15 +613,29 @@ class ProfilePoolScheduler:
                 except ValueError:
                     continue
                 try:
-                    await actor.drain_actor.remote()
-                    status = await actor.status.remote()
-                except RayError:
+                    await asyncio.wait_for(actor.drain_actor.remote(), timeout=5.0)
+                    status = await asyncio.wait_for(actor.status.remote(), timeout=5.0)
+                except (RayError, TimeoutError):
+                    complete = False
                     continue
                 if (
                     int(status.get("running_leases", 0)) == 0
                     and int(status.get("reserved_leases", 0)) == 0
                 ):
                     ray.kill(actor, no_restart=True)
+                else:
+                    # A busy old actor must remain eligible on the next pool
+                    # snapshot/reaper tick, not be forgotten after one scan.
+                    complete = False
+        return complete
+
+    @staticmethod
+    def _legacy_actor_names(runtime_profile: str, replica: int) -> tuple[str, ...]:
+        digest = hashlib.sha256(runtime_profile.encode("utf-8")).hexdigest()[:20]
+        return (
+            f"pyscripts-runtime-{digest}-{replica}",
+            *(f"pyscripts-runtime-v{version}-{digest}-{replica}" for version in range(2, 9)),
+        )
 
     async def _create_actor_replica(
         self,
@@ -715,6 +731,14 @@ class ProfilePoolScheduler:
             for key, handle in self._actors.items()
             if key[0] == environment_digest
         ]
+        # Detached actors from previous worker protocols must also drain before
+        # finalizing a recovered retirement, including their running leases.
+        for replica in range(self.settings.actor_max_per_profile):
+            for name in self._legacy_actor_names(environment_digest, replica):
+                try:
+                    actors.append((None, ray.get_actor(name, namespace=self.settings.ray_namespace)))
+                except ValueError:
+                    continue
         if not actors:
             self._profiles.pop(environment_digest, None)
             self._profile_traffic.pop(environment_digest, None)
@@ -723,16 +747,29 @@ class ProfilePoolScheduler:
             self._compute_warm_nodes.pop(environment_digest, None)
             self._compute_warm_cursor.pop(environment_digest, None)
             return True
-        await asyncio.gather(
-            *(handle.drain_actor.remote() for _, handle in actors),
-            return_exceptions=True,
-        )
         deadline = time.monotonic() + timeout_seconds
-        while True:
-            statuses = await asyncio.gather(
-                *(handle.status.remote() for _, handle in actors),
+        try:
+            await asyncio.wait_for(asyncio.gather(
+                *(handle.drain_actor.remote() for _, handle in actors),
                 return_exceptions=True,
-            )
+            ), timeout=timeout_seconds)
+        except TimeoutError:
+            return False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                statuses = await asyncio.wait_for(asyncio.gather(
+                    *(handle.status.remote() for _, handle in actors),
+                    return_exceptions=True,
+                ), timeout=remaining)
+            except TimeoutError:
+                return False
+            for item in statuses:
+                if isinstance(item, BaseException) and not isinstance(item, ActorDiedError):
+                    # A lost connection or unknown status is not proof of idle.
+                    raise item
             busy = any(
                 not isinstance(item, BaseException)
                 and (
@@ -748,7 +785,8 @@ class ProfilePoolScheduler:
             await asyncio.sleep(self.settings.actor_scheduler_poll_seconds)
         for key, handle in actors:
             ray.kill(handle, no_restart=True)
-            self._actors.pop(key, None)
+            if key is not None:
+                self._actors.pop(key, None)
         self._profiles.pop(environment_digest, None)
         self._profile_traffic.pop(environment_digest, None)
         self._legacy_checked_profiles.discard(environment_digest)
@@ -1042,7 +1080,6 @@ class ProfilePoolScheduler:
     @staticmethod
     def _actor_name(runtime_profile: str, replica: int) -> str:
         digest = hashlib.sha256(runtime_profile.encode("utf-8")).hexdigest()[:20]
-        # Version the detached actor protocol. V7 transfers restart ownership
-        # from Ray to the scheduler so old actors are replaced during rollout.
+        # V9 adds per-lease cancellation of RUNNING IO and its child tasks.
         # Older actors may finish in-flight work before they are reclaimed.
-        return f"pyscripts-runtime-v8-{digest}-{replica}"
+        return f"pyscripts-runtime-v9-{digest}-{replica}"
