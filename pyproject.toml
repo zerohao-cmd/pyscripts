@@ -14,7 +14,7 @@ dependencies = [
     "protobuf>=6.31.0",
     "pyscripts-hook",
     "pydantic-settings>=2.10.0",
-    "ray>=2.58.0",
+    "ray==2.58.0",
     "sqlalchemy[asyncio]>=2.0.40",
     "tzdata>=2026.2",
     "uvicorn[standard]>=0.35.0",
@@ -52,6 +52,8 @@ pyscripts-hook = { workspace = true }
 
 [[tool.uv.index]]
 name = "pypi"
+# This endpoint is for publishing the Hook package, not an image-build dependency.
+explicit = true
 url = "http://192.168.0.11:12341/simple/"
 publish-url = "http://192.168.0.11:12341"
 allow-insecure-host = "http://192.168.0.11:12341"

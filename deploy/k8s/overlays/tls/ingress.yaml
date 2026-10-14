@@ -1,0 +1,51 @@
+# K3s default Traefik. Point both hostnames to the ingress address and create
+# Secret pyscripts-tls in namespace pyscripts with a certificate for both names.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pyscripts-http
+  namespace: pyscripts
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - secretName: pyscripts-tls
+      hosts: [pyscripts.example.com]
+  rules:
+    - host: pyscripts.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pyscripts-http
+                port:
+                  name: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pyscripts-grpc
+  namespace: pyscripts
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - secretName: pyscripts-tls
+      hosts: [grpc.pyscripts.example.com]
+  rules:
+    - host: grpc.pyscripts.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pyscripts-grpc
+                port:
+                  name: grpc

@@ -521,7 +521,7 @@ requires-dist = [
     { name = "protobuf", specifier = ">=6.31.0" },
     { name = "pydantic-settings", specifier = ">=2.10.0" },
     { name = "pyscripts-hook", editable = "pyscripts_hook" },
-    { name = "ray", specifier = ">=2.58.0" },
+    { name = "ray", specifier = "==2.58.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.40" },
     { name = "tzdata", specifier = ">=2026.2" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.35.0" },

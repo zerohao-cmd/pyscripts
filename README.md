@@ -26,7 +26,7 @@ into the same actor while retaining isolated Python module namespaces.
 ## Configuration
 
 项目部署步骤见 [deploy/README.md](./deploy/README.md)：准备数据库和对象存储、
-部署 Kubernetes/K3s Ray 集群、配置并启动 Compose、发布服务及验证调用。
+构建 Dockerfile 镜像、在 Kubernetes/K3s 启动网关和 Ray 集群、发布服务及验证调用。
 
 Copy `.env.example` to `.env` and provide the database password locally. Do
 not commit `.env`.
@@ -50,46 +50,43 @@ uv run pyscripts-db --init
 uv run uvicorn pyscripts.api:app --reload
 ```
 
-### Docker Compose
+### Kubernetes deployment
 
-The Compose deployment runs the control plane, HTTP API, gRPC gateway, and
-prebuilt Web console in one container. PostgreSQL, the Ray cluster, and S3
-object storage remain external services; create the database and object-storage
-bucket first. On first startup the application creates its database tables.
-
-Copy `.env.example` to `.env`, replace every placeholder credential, and set
-`PYSCRIPTS_DATABASE_HOST`, `PYSCRIPTS_RAY_ADDRESS`, and
-`PYSCRIPTS_OBJECT_STORE_ENDPOINT_URL` to addresses reachable **from the
-container**. A Kubernetes-only `*.svc.cluster.local` Ray address will not work
-from Docker outside that cluster. Ray workers must also be able to reach the
-object-store endpoint embedded in presigned artifact URLs. For services on the
-Docker host, `host.docker.internal` is available in the container. Outside
-Kubernetes, worker-pool discovery sees only Ray nodes that are currently up;
-if you need to select a pool that has scaled to zero, run the control plane
-inside Kubernetes with RayCluster read access instead.
+正式部署统一使用 Kubernetes/K3s。Dockerfile 构建网关镜像（包含 Web UI），
+Kustomize 部署网关、RayCluster、认证、Service 和健康探针。
+PostgreSQL 和 S3 使用已有服务；具体步骤见 [部署指南](./deploy/README.md)。
+应用配置统一使用 dotenv `.env`：原生从启动目录读取，K8s 通过 Secret
+只读挂载到 `/app/.env`，两种方式使用相同语法和配置模型。
 
 ```bash
-docker compose config --quiet
-docker compose up -d --build
-docker compose ps
+# Configure credentials and the image name/tag first; install KubeRay as documented.
+cp -n deploy/k8s/base/.env.example deploy/k8s/base/.env
+chmod 600 deploy/k8s/base/.env
+kubectl apply -k deploy/k8s/overlays/lan
+kubectl -n pyscripts rollout status deployment/pyscripts --timeout=900s
 ```
 
-The console and HTTP API listen at `http://127.0.0.1:8000`, and gRPC (when
-enabled) at `127.0.0.1:50051`. Set `PYSCRIPTS_HTTP_BIND`, `PYSCRIPTS_HTTP_PORT`,
-`PYSCRIPTS_GRPC_BIND`, or `PYSCRIPTS_GRPC_HOST_PORT` in `.env` to change the
-published host addresses/ports. The container always listens internally on
-8000 and 50051. Keep the default loopback binding unless a TLS reverse proxy
-or a trusted private network protects these endpoints; Ray Client itself must
-also remain on a trusted network.
+内网启动只开放 Web UI/REST 的 `30080` 和 gRPC 的 `30551`，Ray 端口不对外公开。
+K3s/Traefik 的 TLS 入口使用 `kubectl apply -k deploy/k8s/overlays/tls`，HTTP 与 gRPC 通过各自域名共享 `443`。
+部署交付为文档和 YAML 配置示例。无 Git 的管理机可通过文件传输获得 `deploy` 目录，
+保留目录结构、修改配置后，按 [部署指南](./deploy/README.md) 逐项执行命令。
+网关通过 Secret 引用 Ray token；Web UI 管理会话和业务 API Token 继续分别鉴权。
+网关保持单实例、单 Uvicorn worker，使用 Recreate 更新。
+
+### Native testing
+
+测试直接运行 Python、HTTP/gRPC 和本地 Ray 进程：
 
 ```bash
-docker compose logs -f pyscripts
-docker compose down
+uv sync --locked --dev
+uv run --no-sync pytest
 ```
 
-`down` leaves the named contract-cache volume intact. Rebuild the image to
-deploy new control-plane or UI code. Run only one Uvicorn worker per container
-because that process owns the gRPC listener.
+原生进程启动测试使用临时 SQLite 和独立端口，不改现有 PostgreSQL 或运行中的服务；
+Ray 集成测试实际执行 Actor 和 Compute Task。
+原生手工调试使用项目根目录 `.env.example`，本地 Ray 设置
+`PYSCRIPTS_RAY_ADDRESS=local`、`PYSCRIPTS_RAY_USE_LABEL_SELECTOR=false`。
+正式 K8s 凭据模板为 `deploy/k8s/base/.env.example`，不要混用两种环境文件。
 
 Service registration and repository URL updates accept only HTTP or HTTPS Git
 addresses, such as `https://git.example.com/team/orders.git`. SSH, `git://`,

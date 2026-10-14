@@ -33,9 +33,7 @@ RUN apt-get update \
 
 WORKDIR /app
 ENV PATH="/app/.venv/bin:${PATH}" \
-    PYTHONUNBUFFERED=1 \
-    PYSCRIPTS_UI_DIST_PATH=/app/ui/dist \
-    PYSCRIPTS_CONTRACT_CACHE_ROOT=/var/lib/pyscripts/contracts
+    PYTHONUNBUFFERED=1
 COPY --from=python-build /app/.venv/ /app/.venv/
 COPY --from=ui-build /build/ui/dist/ /app/ui/dist/
 

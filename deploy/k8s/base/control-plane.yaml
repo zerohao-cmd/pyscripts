@@ -1,0 +1,172 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pyscripts
+  labels:
+    app.kubernetes.io/name: pyscripts
+    app.kubernetes.io/component: control-plane
+    app.kubernetes.io/part-of: pyscripts
+spec:
+  replicas: 1
+  # The application currently owns Actor lifecycle and background work.
+  # Do not overlap old/new instances or scale replicas before adding coordination.
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 900
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pyscripts
+      app.kubernetes.io/component: control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pyscripts
+        app.kubernetes.io/component: control-plane
+        app.kubernetes.io/part-of: pyscripts
+    spec:
+      # Use DNS for Service discovery. Generated PYSCRIPTS_GRPC_PORT would
+      # override the integer setting in .env with a tcp:// URL.
+      enableServiceLinks: false
+      serviceAccountName: pyscripts-control-plane
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-ray
+          image: pyscripts-gateway
+          imagePullPolicy: IfNotPresent
+          command: [python, -c]
+          args:
+            - |
+              import time
+              import ray
+              from pyscripts.config import Settings
+              settings = Settings()
+              deadline = time.monotonic() + 600
+              while time.monotonic() < deadline:
+                  try:
+                      ray.init(address=settings.ray_address,
+                               namespace=settings.ray_namespace)
+                      nodes = ray.nodes()
+                      if any(n.get('Alive') and n.get('Labels', {}).get(
+                              settings.ray_worker_pool_label_key) == settings.default_worker_pool
+                             for n in nodes):
+                          print('Authenticated Ray connection and default Worker ready', flush=True)
+                          break
+                  except Exception:
+                      print('Waiting for authenticated Ray and Worker', flush=True)
+                  finally:
+                      ray.shutdown()
+                  time.sleep(5)
+              else:
+                  raise SystemExit('Ray was not ready within 600 seconds')
+          env:
+            - name: RAY_AUTH_MODE
+              value: token
+            - name: HOME
+              value: /tmp/pyscripts-home
+            - name: RAY_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pyscripts-ray
+                  key: auth_token
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /app/.env
+              subPath: .env
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: pyscripts
+          image: pyscripts-gateway
+          imagePullPolicy: IfNotPresent
+          command: [uvicorn, pyscripts.api:app]
+          args: [--host, 0.0.0.0, --port, "8000", --workers, "1", --timeout-graceful-shutdown, "60"]
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: grpc
+              containerPort: 50051
+          env:
+            - name: RAY_AUTH_MODE
+              value: token
+            - name: HOME
+              value: /tmp/pyscripts-home
+            - name: RAY_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pyscripts-ray
+                  key: auth_token
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 6Gi
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: config
+              mountPath: /app/.env
+              subPath: .env
+              readOnly: true
+            - name: contract-cache
+              mountPath: /var/lib/pyscripts/contracts
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          secret:
+            secretName: pyscripts-config
+            defaultMode: 0440
+        # These are rebuildable scratch files; durable artifacts live in S3.
+        - name: contract-cache
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi

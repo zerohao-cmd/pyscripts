@@ -1,0 +1,21 @@
+# Ray peer RPC uses multiple/dynamic ports. Permit only members of this
+# RayCluster and the control plane; keep egress open for S3/PyPI/K8s API.
+# Requires a CNI that enforces Kubernetes NetworkPolicy (including default K3s).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pyscripts-ray-internal
+spec:
+  podSelector:
+    matchLabels:
+      ray.io/cluster: pyscripts-ray
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              ray.io/cluster: pyscripts-ray
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: pyscripts
+              app.kubernetes.io/component: control-plane
