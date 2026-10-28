@@ -5,6 +5,7 @@ import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
@@ -150,7 +151,25 @@ def test_hook_package_is_platform_provided() -> None:
     )
 
 
-def test_runtime_profile_stores_custom_index_and_validates_url(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("pip_index_url", "expected_index_url"),
+    [
+        ("http://192.168.0.11:8080", "http://192.168.0.11:8080/simple/"),
+        ("http://192.168.0.11:8080/simple", "http://192.168.0.11:8080/simple/"),
+        ("http://192.168.0.11:8080/simple/", "http://192.168.0.11:8080/simple/"),
+        (
+            "http://192.168.0.11:12342/shrx/pkg/+simple",
+            "http://192.168.0.11:12342/shrx/pkg/+simple/",
+        ),
+        (
+            "http://192.168.0.11:12342/shrx/pkg/+simple/",
+            "http://192.168.0.11:12342/shrx/pkg/+simple/",
+        ),
+    ],
+)
+def test_runtime_profile_stores_custom_index_and_validates_url(
+    tmp_path: Path, pip_index_url: str, expected_index_url: str
+) -> None:
     app = create_app(
         Settings(
             database_url=SecretStr(
@@ -187,15 +206,28 @@ def test_runtime_profile_stores_custom_index_and_validates_url(tmp_path: Path) -
             "/admin/runtime-labels",
             json={
                 **request,
-                "pip_index_url": "http://192.168.0.11:8080",
+                "pip_index_url": pip_index_url,
             },
         )
         assert created.status_code == 201, created.text
         version = created.json()
         assert version["pip_source"] == "custom"
-        assert version["pip_index_url"] == "http://192.168.0.11:8080/simple/"
+        assert version["pip_index_url"] == expected_index_url
         listed = client.get("/admin/runtime-labels").json()
         assert listed[0]["versions"][0]["pip_index_url"] == version["pip_index_url"]
+
+        # Creating another version from an already-normalized URL must preserve
+        # the index path, including devpi's +simple endpoint.
+        created_version = client.post(
+            f"/admin/runtime-labels/{version['label_id']}/versions",
+            json={
+                key: value
+                for key, value in {**request, "pip_index_url": expected_index_url}.items()
+                if key != "name"
+            },
+        )
+        assert created_version.status_code == 201, created_version.text
+        assert created_version.json()["pip_index_url"] == expected_index_url
 
         profile = app.state.profile_scheduler.register_runtime_profile(
             environment_digest=version["environment_digest"],
@@ -205,9 +237,7 @@ def test_runtime_profile_stores_custom_index_and_validates_url(tmp_path: Path) -
             pip_source=version["pip_source"],
             pip_index_url=version["pip_index_url"],
         )
-        assert profile.runtime_env["pip"]["pip_install_options"][3] == (
-            "http://192.168.0.11:8080/simple/"
-        )
+        assert profile.runtime_env["pip"]["pip_install_options"][3] == expected_index_url
 
 
 def build_artifact(

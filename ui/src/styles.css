@@ -296,11 +296,16 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .runtime-label-card { overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: #101512; }
 .runtime-label-card__header { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 17px 18px; border-bottom: 1px solid var(--border); }
 .runtime-label-card__header h3 { font-size: 18px; }
+.runtime-label-title { padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-align: left; cursor: pointer; }
+.runtime-label-title:hover, .runtime-version__open:hover strong { color: var(--mint); }
+.runtime-label-title:focus-visible, .runtime-version__open:focus-visible { outline: 2px solid var(--mint-strong); outline-offset: 4px; border-radius: 3px; }
 .runtime-version-list { display: grid; }
-.runtime-version { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(150px, .9fr) minmax(160px, 1.2fr) 52px auto 120px; align-items: center; gap: 14px; min-height: 78px; padding: 13px 17px; border-bottom: 1px solid var(--border); }
+.runtime-version { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(150px, .9fr) minmax(160px, 1.2fr) 52px auto 120px; align-items: center; gap: 14px; min-height: 78px; padding: 13px 17px; border-bottom: 1px solid var(--border); cursor: pointer; }
+.runtime-version:hover { background-color: rgb(255 255 255 / 3%); }
 .runtime-version:last-child { border-bottom: 0; }
 .runtime-version.is-active { background: linear-gradient(90deg, rgb(66 236 131 / 7%), transparent 55%); box-shadow: inset 3px 0 var(--mint-strong); }
 .runtime-version__identity, .runtime-version__pool, .runtime-version__deps, .runtime-version__refs { display: grid; min-width: 0; gap: 5px; }
+.runtime-version__open { padding: 0; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
 .runtime-version__identity strong, .runtime-version__pool strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .runtime-version__identity span, .runtime-version__pool span, .runtime-version__deps span, .runtime-version__refs span { color: var(--faint); font-size: 10px; }
 .runtime-version__deps small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
@@ -319,6 +324,25 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .modal { width: min(680px, 100%); max-height: calc(100vh - 60px); overflow-y: auto; border: 1px solid var(--border-strong); border-radius: 16px; background: #141a17; box-shadow: 0 30px 90px rgb(0 0 0 / 55%); }
 .modal__header { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 22px 24px; border-bottom: 1px solid var(--border); }
 .modal__header h2 { font-size: 22px; letter-spacing: -.035em; }
+.runtime-detail { display: grid; gap: 21px; padding: 24px; }
+.runtime-detail__meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin: 0; }
+.runtime-detail__meta > div { display: grid; min-width: 0; gap: 7px; }
+.runtime-detail__meta dt { color: var(--faint); font-size: 11px; }
+.runtime-detail__meta dd { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
+.runtime-detail__wide { grid-column: 1 / -1; }
+.runtime-detail__section { display: grid; min-width: 0; gap: 10px; }
+.runtime-detail__section h3, .runtime-detail__section summary { margin: 0; font-size: 13px; font-weight: 700; }
+.runtime-detail__section h3 span { margin-left: 6px; color: var(--faint); font-size: 11px; font-weight: 400; }
+.runtime-detail__section p { margin: 0; font-size: 12px; }
+.runtime-detail__section summary { cursor: pointer; }
+.runtime-detail__section[open] summary { margin-bottom: 10px; }
+.runtime-detail__code { max-height: 320px; overflow: auto; margin: 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); background: #0e1311; font: 12px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.runtime-detail__code--error { color: #ffaaa5; border-color: rgb(255 124 118 / 25%); }
+.runtime-detail__packages { max-height: 320px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+.runtime-detail__packages table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.runtime-detail__packages th, .runtime-detail__packages td { padding: 9px 12px; border-bottom: 1px solid var(--border); text-align: left; overflow-wrap: anywhere; }
+.runtime-detail__packages th { position: sticky; top: 0; background: var(--surface-raised); color: var(--muted); }
+.runtime-detail__packages tr:last-child td { border-bottom: 0; }
 .invocation-log-detail { display: grid; gap: 16px; padding: 24px; }
 .invocation-log-meta { display: grid; grid-template-columns: .7fr 2fr .7fr .7fr; gap: 12px; }
 .invocation-log-meta > div { display: grid; min-width: 0; align-content: start; gap: 7px; }
@@ -495,7 +519,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .runtime-version { grid-template-columns: minmax(0, 1fr) auto; gap: 10px; padding: 13px; }
   .runtime-version__actions { grid-column: 1 / -1; justify-content: flex-start; }
   .field-grid { grid-template-columns: 1fr; }
-  .invocation-log-detail { padding: 18px; }
+  .invocation-log-detail, .runtime-detail { padding: 18px; }
   .invocation-log-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .modal-backdrop { padding: 0; place-items: end center; }
   .modal { max-height: 92vh; border-radius: 16px 16px 0 0; }

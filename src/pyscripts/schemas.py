@@ -496,7 +496,7 @@ class RuntimeProfileSpecRequest(BaseModel):
                 "pip_index_url must be an HTTP(S) URL without credentials, query or fragment"
             )
         path = parsed.path.rstrip("/")
-        if not path.endswith("/simple"):
+        if not path.endswith(("/simple", "/+simple")):
             path += "/simple"
         self.pip_index_url = urlunsplit(
             (parsed.scheme, parsed.netloc, path + "/", "", "")

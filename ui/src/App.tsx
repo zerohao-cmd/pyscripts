@@ -12,6 +12,7 @@ import {
 
 import { ApiError, api } from "./api";
 import { Icon, type IconName } from "./icons";
+import { latestRuntimeVersion, runtimeVersionInput } from "./runtimeProfiles";
 import type {
   ApiToken,
   Contract,
@@ -428,36 +429,113 @@ const ServiceSettingsModal: Component<{
   );
 };
 
+function pipSourceLabel(source: RuntimeProfileVersion["pip_source"]): string {
+  return source === "custom" ? "自定义 PyPI" : source === "private" ? "平台私有源" : "默认 / 官方源";
+}
+
+const RuntimeProfileDetailModal: Component<{
+  label: RuntimeLabel;
+  profile: RuntimeProfileVersion;
+  onClose: () => void;
+  onCreateVersion: () => void;
+}> = (props) => {
+  const installed = createMemo(() => Object.entries(props.profile.resolved_dependencies)
+    .sort(([left], [right]) => left.localeCompare(right)));
+
+  return (
+    <Modal eyebrow="运行环境详情" title={props.profile.profile_ref} onClose={props.onClose}>
+      <div class="runtime-detail">
+        <dl class="runtime-detail__meta">
+          <div><dt>状态</dt><dd><StatusBadge value={props.profile.status} />{props.profile.id === props.label.active_version_id && <span class="muted"> · 当前活动版本</span>}</dd></div>
+          <div><dt>服务引用</dt><dd>{props.profile.reference_count}</dd></div>
+          <div><dt>Python</dt><dd class="mono">{props.profile.python_version}</dd></div>
+          <div><dt>Worker 类型</dt><dd class="mono">{props.profile.worker_pool}</dd></div>
+          <div><dt>创建时间</dt><dd>{formatDate(props.profile.created_at)}</dd></div>
+          <div><dt>校验时间</dt><dd>{formatDate(props.profile.validated_at)}</dd></div>
+          <Show when={props.profile.retired_at}><div><dt>停用时间</dt><dd>{formatDate(props.profile.retired_at)}</dd></div></Show>
+          <div class="runtime-detail__wide"><dt>PyPI 来源</dt><dd>{pipSourceLabel(props.profile.pip_source)}</dd></div>
+          <Show when={props.profile.pip_index_url}><div class="runtime-detail__wide"><dt>包源地址</dt><dd class="mono">{props.profile.pip_index_url}</dd></div></Show>
+          <Show when={props.profile.environment_digest}><div class="runtime-detail__wide"><dt>环境摘要</dt><dd class="mono">{props.profile.environment_digest}</dd></div></Show>
+        </dl>
+        <section class="runtime-detail__section">
+          <h3>依赖配置 <span>{props.profile.requested_dependencies.length} 项</span></h3>
+          <pre class="runtime-detail__code">{props.profile.requested_dependencies.join("\n") || "无额外依赖，使用基础镜像中的包。"}</pre>
+        </section>
+        <section class="runtime-detail__section">
+          <h3>导入检查</h3>
+          <pre class="runtime-detail__code">{props.profile.import_checks.join("\n") || "未配置导入检查。"}</pre>
+        </section>
+        <section class="runtime-detail__section">
+          <h3>已解析依赖 <span>{installed().length} 项</span></h3>
+          <Show when={installed().length > 0} fallback={<p class="muted">尚无依赖解析结果。</p>}>
+            <div class="runtime-detail__packages">
+              <table aria-label="已解析依赖"><thead><tr><th>包名</th><th>版本</th></tr></thead><tbody>
+                <For each={installed()}>{([name, version]) => <tr><td class="mono">{name}</td><td class="mono">{version}</td></tr>}</For>
+              </tbody></table>
+            </div>
+          </Show>
+        </section>
+        <Show when={props.profile.error}>
+          <section class="runtime-detail__section"><h3>错误信息</h3><pre class="runtime-detail__code runtime-detail__code--error">{props.profile.error}</pre></section>
+        </Show>
+        <Show when={Object.keys(props.profile.validation_result).length > 0}>
+          <details class="runtime-detail__section"><summary>校验详情</summary><pre class="runtime-detail__code">{JSON.stringify(props.profile.validation_result, null, 2)}</pre></details>
+        </Show>
+        <footer class="modal__footer">
+          <button class="button button--ghost" type="button" onClick={props.onClose}>关闭</button>
+          <button class="button button--primary" type="button" onClick={props.onCreateVersion}><Icon name="plus" />基于此版本创建</button>
+        </footer>
+      </div>
+    </Modal>
+  );
+};
+
 const RuntimeProfileModal: Component<{
   label?: RuntimeLabel | null;
+  sourceProfile?: RuntimeProfileVersion | null;
   workerPools: WorkerPool[];
   onClose: () => void;
   onCreated: (profile: RuntimeProfileVersion) => void;
 }> = (props) => {
   const [name, setName] = createSignal("");
-  const activeProfile = () => props.label?.versions.find(
-    (version) => version.id === props.label?.active_version_id,
-  );
+  const initialProfile = props.sourceProfile ?? latestRuntimeVersion(props.label?.versions ?? []);
+  const initialInput = initialProfile ? runtimeVersionInput(initialProfile) : null;
+  const [sourceProfileId, setSourceProfileId] = createSignal(initialProfile?.id ?? "");
   const [pythonVersion, setPythonVersion] = createSignal(
-    activeProfile()?.python_version ?? "3.12",
+    initialInput?.python_version ?? "3.12",
   );
   const [workerPool, setWorkerPool] = createSignal(
-    activeProfile()?.worker_pool ?? props.workerPools[0]?.name ?? "",
+    initialInput?.worker_pool ?? props.workerPools[0]?.name ?? "",
   );
   const [dependencies, setDependencies] = createSignal(
-    activeProfile()?.requested_dependencies.join("\n") ?? "",
+    initialInput?.dependencies.join("\n") ?? "",
   );
   const [imports, setImports] = createSignal(
-    activeProfile()?.import_checks.join("\n") ?? "",
+    initialInput?.import_checks.join("\n") ?? "",
   );
   const [pipSource, setPipSource] = createSignal<RuntimeProfileInput["pip_source"]>(
-    activeProfile()?.pip_source ?? "default",
+    initialInput?.pip_source ?? "default",
   );
   const [pipIndexUrl, setPipIndexUrl] = createSignal(
-    activeProfile()?.pip_index_url ?? "",
+    initialInput?.pip_index_url ?? "",
   );
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
+
+  const selectSourceProfile = (id: string) => {
+    const profile = props.label?.versions.find((version) => version.id === id);
+    if (!profile) return;
+    const input = runtimeVersionInput(profile);
+    setSourceProfileId(id);
+    setPythonVersion(input.python_version);
+    setWorkerPool(input.worker_pool);
+    setDependencies(input.dependencies.join("\n"));
+    setImports(input.import_checks.join("\n"));
+    setPipSource(input.pip_source);
+    setPipIndexUrl(input.pip_index_url ?? "");
+    setError("");
+  };
+  const hasWorkerPool = () => props.workerPools.some((pool) => pool.name === workerPool());
 
   const lines = (value: string) =>
     value.split("\n").map((item) => item.trim()).filter(Boolean);
@@ -493,6 +571,15 @@ const RuntimeProfileModal: Component<{
       onClose={props.onClose}
     >
       <form class="form-stack" onSubmit={submit}>
+        <Show when={props.label && props.label.versions.length > 0}>
+          <label class="field">
+            <span>基于版本</span>
+            <select value={sourceProfileId()} onChange={(event) => selectSourceProfile(event.currentTarget.value)} disabled={busy()}>
+              <For each={props.label?.versions}>{(version) => <option value={version.id}>{version.profile_ref} · {version.status}{version.id === props.label?.active_version_id ? " · 当前活动版本" : ""}</option>}</For>
+            </select>
+            <small>已载入所选版本的配置，可在此基础上修改。切换基础版本会重新载入该版本的配置。</small>
+          </label>
+        </Show>
         <Show when={!props.label}>
           <label class="field">
             <span>标签名称</span>
@@ -509,11 +596,12 @@ const RuntimeProfileModal: Component<{
             <span>Worker 类型</span>
             <select required value={workerPool()} onChange={(event) => setWorkerPool(event.currentTarget.value)}>
               <option value="" disabled>选择 K8s 提供的 Worker</option>
+              <Show when={workerPool() && !hasWorkerPool()}><option value={workerPool()} disabled>{workerPool()} · 当前不可用</option></Show>
               <For each={props.workerPools}>{(pool) => (
                 <option value={pool.name}>{pool.name} · {pool.node_count} nodes</option>
               )}</For>
             </select>
-            <small>由 K8s/KubeRay 定义，只能选择，不能在这里修改。</small>
+            <small>{workerPool() && !hasWorkerPool() ? "原版本的 Worker 类型当前不可用，请选择可用类型后创建。" : "由 K8s/KubeRay 定义，只能选择，不能在这里修改。"}</small>
           </label>
         </div>
         <label class="field">
@@ -534,7 +622,7 @@ const RuntimeProfileModal: Component<{
           <label class="field">
             <span>PyPI server 地址</span>
             <input type="url" required value={pipIndexUrl()} onInput={(event) => setPipIndexUrl(event.currentTarget.value)} placeholder="http://192.168.0.11:8080/simple/" spellcheck={false} />
-            <small>填写 Ray Worker 可访问的 HTTP(S) 地址；省略 /simple/ 时会自动补上。不要在地址中放用户名或密码。</small>
+            <small>填写 Ray Worker 可访问的 HTTP(S) 地址；支持 /simple/ 和 devpi 的 /+simple/，省略索引后缀时补全 /simple/。不要在地址中放用户名或密码。</small>
           </label>
         </Show>
         <label class="field">
@@ -544,7 +632,7 @@ const RuntimeProfileModal: Component<{
         <Show when={error()}><div class="form-error">{error()}</div></Show>
         <footer class="modal__footer">
           <button class="button button--ghost" type="button" onClick={props.onClose}>取消</button>
-          <button class="button button--primary" type="submit" disabled={busy() || props.workerPools.length === 0}>
+          <button class="button button--primary" type="submit" disabled={busy() || !hasWorkerPool()}>
             <Show when={!busy()} fallback="正在创建临时 Ray 环境并校验…"><Icon name="plus" />创建并校验</Show>
           </button>
         </footer>
@@ -737,6 +825,8 @@ const AdminConsole: Component<{
   const [showRuntimeModal, setShowRuntimeModal] = createSignal(false);
   const [showPasswordModal, setShowPasswordModal] = createSignal(false);
   const [runtimeModalLabel, setRuntimeModalLabel] = createSignal<RuntimeLabel | null>(null);
+  const [runtimeModalSource, setRuntimeModalSource] = createSignal<RuntimeProfileVersion | null>(null);
+  const [selectedRuntimeId, setSelectedRuntimeId] = createSignal("");
   const [toast, setToast] = createSignal<Toast | null>(null);
   const [selectedInvocation, setSelectedInvocation] = createSignal<Invocation | null>(null);
   const [invocationLogs, setInvocationLogs] = createSignal<InvocationLog[]>([]);
@@ -746,6 +836,13 @@ const AdminConsole: Component<{
   const selectedService = createMemo(() =>
     services().find((service) => service.id === selectedId()),
   );
+  const selectedRuntime = createMemo(() => {
+    for (const label of runtimeLabels()) {
+      const profile = label.versions.find((version) => version.id === selectedRuntimeId());
+      if (profile) return { label, profile };
+    }
+    return undefined;
+  });
   const activeCount = createMemo(() =>
     services().filter((service) => service.status === "ACTIVE").length,
   );
@@ -939,8 +1036,13 @@ const AdminConsole: Component<{
     }
   };
 
-  const openRuntimeModal = (label: RuntimeLabel | null = null) => {
+  const openRuntimeModal = (
+    label: RuntimeLabel | null = null,
+    sourceProfile: RuntimeProfileVersion | null = null,
+  ) => {
     setRuntimeModalLabel(label);
+    setRuntimeModalSource(sourceProfile);
+    setSelectedRuntimeId("");
     setShowRuntimeModal(true);
   };
 
@@ -1195,19 +1297,19 @@ const AdminConsole: Component<{
                   <For each={runtimeLabels()}>{(label) => (
                     <article class="runtime-label-card">
                       <header class="runtime-label-card__header">
-                        <div><span class="eyebrow">RUNTIME LABEL</span><h3>{label.name}</h3></div>
-                        <button class="button button--outline button--small" onClick={() => openRuntimeModal(label)}><Icon name="plus" size={15} />新版本</button>
+                        <div><span class="eyebrow">RUNTIME LABEL</span><h3><button class="runtime-label-title" type="button" disabled={label.versions.length === 0} onClick={() => setSelectedRuntimeId(latestRuntimeVersion(label.versions)?.id ?? "")} title="查看最新版本详情">{label.name}</button></h3></div>
+                        <button class="button button--outline button--small" title="基于最新版本修改" onClick={() => openRuntimeModal(label)}><Icon name="plus" size={15} />新版本</button>
                       </header>
                       <div class="runtime-version-list">
                         <For each={label.versions}>{(profile) => (
-                          <div classList={{ "runtime-version": true, "is-active": profile.id === label.active_version_id }}>
-                            <div class="runtime-version__identity">
+                          <div classList={{ "runtime-version": true, "is-active": profile.id === label.active_version_id }} onClick={() => setSelectedRuntimeId(profile.id)}>
+                            <button class="runtime-version__identity runtime-version__open" type="button" onClick={() => setSelectedRuntimeId(profile.id)} aria-label={`查看 ${profile.profile_ref} 详情`}>
                               <strong class="mono">{profile.profile_ref}</strong>
                               <span>{formatDate(profile.created_at)} · Python {profile.python_version}</span>
-                            </div>
+                            </button>
                             <div class="runtime-version__pool">
                               <span>WORKER TYPE</span>
-                              <strong class="mono">{profile.worker_pool} · {profile.pip_source === "custom" ? "自定义 PyPI" : profile.pip_source === "private" ? "平台私有源" : "官方源"}</strong>
+                              <strong class="mono">{profile.worker_pool} · {pipSourceLabel(profile.pip_source)}</strong>
                               <Show when={profile.pip_index_url}><small class="mono">{profile.pip_index_url}</small></Show>
                             </div>
                             <div class="runtime-version__deps">
@@ -1216,7 +1318,7 @@ const AdminConsole: Component<{
                             </div>
                             <div class="runtime-version__refs"><strong>{profile.reference_count}</strong><span>服务引用</span></div>
                             <StatusBadge value={profile.status} />
-                            <div class="runtime-version__actions">
+                            <div class="runtime-version__actions" onClick={(event) => event.stopPropagation()}>
                               <Show when={profile.status === "READY"}><button class="button button--primary button--small" onClick={() => void activateRuntime(profile)}>激活</button></Show>
                               <Show when={["READY", "FAILED", "RETIRING"].includes(profile.status) && profile.id !== label.active_version_id && profile.reference_count === 0}>
                                 <button class="button button--danger button--small" disabled={profile.status === "RETIRING"} onClick={() => void retireRuntime(profile)}>停用</button>
@@ -1261,7 +1363,8 @@ const AdminConsole: Component<{
       <Show when={showCreateService()}><CreateServiceModal onClose={() => setShowCreateService(false)} onCreated={(service) => { setShowCreateService(false); setSelectedId(service.id); setView("services"); notify(`${service.name} 已注册`); void load(true); }} /></Show>
       <Show when={showServiceSettings() && selectedService()} keyed>{(service) => <ServiceSettingsModal service={service} onClose={() => setShowServiceSettings(false)} onUpdated={(updated) => { setShowServiceSettings(false); setServiceDetail(updated); setServices((items) => items.map((item) => item.id === updated.id ? updated : item)); notify(`${updated.name} 设置已保存`); void load(true); }} />}</Show>
       <Show when={showPublish() && selectedService()} keyed>{(service) => <PublishRevisionModal service={service} onClose={() => setShowPublish(false)} onPublished={() => { setShowPublish(false); notify(service.status === "STOPPED" ? "Git revision 已发布，服务仍保持停止" : "Git revision 已构建并上线"); void load(true); }} />}</Show>
-      <Show when={showRuntimeModal()}><RuntimeProfileModal label={runtimeModalLabel()} workerPools={workerPools()} onClose={() => setShowRuntimeModal(false)} onCreated={(profile) => { setShowRuntimeModal(false); notify(profile.status === "FAILED" ? `${profile.profile_ref} 校验失败` : `${profile.profile_ref} 已通过校验`, profile.status === "FAILED" ? "danger" : "success"); void load(true); }} /></Show>
+      <Show when={selectedRuntime()} keyed>{(selected) => <RuntimeProfileDetailModal label={selected.label} profile={selected.profile} onClose={() => setSelectedRuntimeId("")} onCreateVersion={() => openRuntimeModal(selected.label, selected.profile)} />}</Show>
+      <Show when={showRuntimeModal()}><RuntimeProfileModal label={runtimeModalLabel()} sourceProfile={runtimeModalSource()} workerPools={workerPools()} onClose={() => setShowRuntimeModal(false)} onCreated={(profile) => { setShowRuntimeModal(false); notify(profile.status === "FAILED" ? `${profile.profile_ref} 校验失败` : `${profile.profile_ref} 已通过校验`, profile.status === "FAILED" ? "danger" : "success"); void load(true); }} /></Show>
       <Show when={selectedInvocation()} keyed>{(invocation) => <InvocationLogModal invocation={invocation} logs={invocationLogs()} loading={invocationLogsLoading()} error={invocationLogsError()} onClose={() => setSelectedInvocation(null)} />}</Show>
       <Show when={showPasswordModal()}><ChangePasswordModal onClose={() => setShowPasswordModal(false)} onChanged={props.onPasswordChanged} /></Show>
       <Show when={toast()} keyed>{(item) => <div class={`toast toast--${item.tone}`}><Icon name={item.tone === "success" ? "check" : "x"} /><span>{item.message}</span></div>}</Show>
